@@ -29,6 +29,19 @@ Matched 5 of 171 indexed skills for "PPT 排版":
 
 命中后直接读那个 `SKILL.md` 就行。中英文关键词都支持。
 
+### `skill_read`
+
+按名字读某个技能的 `SKILL.md` 正文，并且**记一次使用**。
+
+```
+skill_read({ name: "ai-mv-production" })
+```
+
+名字或文件夹名都行，大小写不敏感。
+
+为什么不用直接读文件：记账这件事必须有落点，而 agent 读一个技能的唯一目的就是用它是。
+把「读」和「记」合成一步，排序就能靠真实使用数据变准，不需要额外工具调用，也不需要人手动维护。
+
 ### `skill_catalog`
 
 按分类列出全部技能，每条一句话。用在「我都有什么」这类问题上。
@@ -70,6 +83,24 @@ description: >
 只抓 `description:` 那一行会得到 `>`，索引里就是空描述，永远检索不到。
 这个插件认 `>`、`|`、`>-`、`|-` 四种写法，也会跳过 `_` 开头的存档目录。
 
+## 检索会随使用变准
+
+读过的技能在后续检索里加权，最多 +120%（十次封顶）：
+
+```
+读之前:   ai-mv-production > music-mv > jian-character-mv-director
+读三次后: jian-character-mv-director > ai-mv-production > music-mv
+```
+
+账面记在 `~/.skill-hub/usage.json`：
+
+```json
+{
+  "jian-character-mv-director": { "count": 3, "last": "2026-11-21T12:00:00.000Z" }
+}
+```
+
+删掉这个文件就回到原始排序。它只影响顺序，不影响命中——没读过的技能依然能搜到。
 ## 限制
 
 - 关键词匹配，不是语义检索。中文同义词要自己给全。

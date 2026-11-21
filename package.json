@@ -1,7 +1,7 @@
 {
     "name":  "dsh-skill-index",
-    "version":  "1.0.0",
-    "description":  "Search a local agent-skill library from inside the Harness: keyword ranking over SKILL.md frontmatter, with block-scalar parsing and category awareness.",
+    "version":  "1.1.0",
+    "description":  "Search a local agent-skill library by keyword and read a skill by name. Reads are recorded so search ranks skills you actually use higher.",
     "type":  "module",
     "main":  "index.js",
     "exports":  {

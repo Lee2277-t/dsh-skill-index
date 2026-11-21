@@ -1,6 +1,6 @@
 {
-  "meta": {
-    "title": "Skill index",
-    "description": "Search your local agent-skill library from inside the Harness. Adds skill_search and skill_catalog so an agent can find skills that are not in its prompt."
-  }
+    "meta":  {
+                 "title":  "Skill index",
+                 "description":  "Check the local agent-skill library by keyword, read a skill by name, and rank the skills you actually use higher."
+             }
 }

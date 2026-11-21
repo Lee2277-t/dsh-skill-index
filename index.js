@@ -6,7 +6,11 @@
 //
 // 工具：
 //   skill_search  按关键词在多根源码里检索，返回命中技能的名称、描述与路径
+//   skill_read    读某个技能的 SKILL.md，并记一次使用
 //   skill_catalog 按分类列出全部技能（用于「我都有什么」这类问题）
+//
+// 记账的意义：检索排序会按你真正读过的技能加权。第一次搜出来的第 5 名，
+// 读过三次之后应该排在前面——它已经被验证过对这类任务有用。
 
 import fs from 'node:fs'
 import os from 'node:os'
@@ -181,9 +185,37 @@ function buildIndex(config, force) {
   return cache.skills
 }
 
+// ---------------------------------------------------------------- 使用账本
+
+const USAGE_PATH = path.join(os.homedir(), '.skill-hub', 'usage.json')
+let usageCache = null
+
+function loadUsage() {
+  if (usageCache) return usageCache
+  try {
+    usageCache = new Map(Object.entries(JSON.parse(fs.readFileSync(USAGE_PATH, 'utf8'))))
+  } catch {
+    usageCache = new Map()
+  }
+  return usageCache
+}
+
+function recordUsage(name) {
+  const usage = loadUsage()
+  const key = name.toLowerCase()
+  const prev = usage.get(key) ?? { count: 0, last: null }
+  usage.set(key, { count: prev.count + 1, last: new Date().toISOString() })
+  try {
+    fs.mkdirSync(path.dirname(USAGE_PATH), { recursive: true })
+    fs.writeFileSync(USAGE_PATH, JSON.stringify(Object.fromEntries(usage), null, 1), 'utf8')
+  } catch {
+    // 记不上不影响检索，静默放着
+  }
+}
+
 // ---------------------------------------------------------------- 检索
 
-function score(skill, words) {
+function score(skill, words, usage) {
   const name = skill.name.toLowerCase()
   const folder = skill.folder.toLowerCase()
   const cat = skill.category.toLowerCase()
@@ -198,13 +230,17 @@ function score(skill, words) {
     if (cat.includes(w)) total += 4
     if (desc.includes(w)) total += 3
   }
-  return total
+  if (total === 0) return 0
+  // 读过的技能排前面：最多 +120%，十次封顶
+  const uses = usage?.get(skill.name.toLowerCase())?.count ?? 0
+  return uses > 0 ? Math.round(total * (1 + 0.12 * Math.min(uses, 10))) : total
 }
 
-function formatHit(s, score) {
+function formatHit(s, score, uses) {
   const desc = s.description.length > 160 ? s.description.slice(0, 157) + '…' : s.description
+  const used = uses > 0 ? `  用过 ${uses} 次` : ''
   return [
-    `- ${s.name}  [${s.category}]  score=${score}`,
+    `- ${s.name}  [${s.category}]  score=${score}${used}`,
     desc ? `  ${desc}` : '  (no description)',
     `  ${s.path}`,
   ].join('\n')
@@ -248,8 +284,9 @@ function registerSearch(ctx, config) {
           return `No skills indexed. Checked roots: ${roots || '(none configured)'}`
         }
 
+        const usage = loadUsage()
         const ranked = skills
-          .map((s) => ({ skill: s, score: score(s, words) }))
+          .map((s) => ({ skill: s, score: score(s, words, usage) }))
           .filter((r) => r.score > 0)
           .sort((a, b) => b.score - a.score)
           .slice(0, Math.max(1, Math.min(30, args.limit ?? config.maxResults ?? 8)))
@@ -262,7 +299,7 @@ function registerSearch(ctx, config) {
         }
 
         const header = `Matched ${ranked.length} of ${skills.length} indexed skills for "${words.join(' ')}":`
-        return [header, '', ...ranked.map((r) => formatHit(r.skill, r.score))].join('\n')
+        return [header, '', ...ranked.map((r) => formatHit(r.skill, r.score, usage.get(r.skill.name.toLowerCase())?.count ?? 0))].join('\n')
       },
     }),
   )
@@ -319,7 +356,69 @@ function registerCatalog(ctx, config) {
   )
 }
 
+function registerRead(ctx, config) {
+  ctx.tools.register(
+    defineTool({
+      name: 'skill_read',
+      description:
+        "Read a skill's SKILL.md by name and return its text. Records the read so later skill_search " +
+        'calls rank skills you have actually used higher — prefer this over reading the path by hand, ' +
+        'since it is the same content and it keeps the ranking honest.',
+      parameters: {
+        name: {
+          type: 'string',
+          required: true,
+          description: 'Skill name or its folder name, case insensitive.',
+        },
+      },
+      output: {
+        schema: { type: 'string' },
+        render: (_args, value) => [{ type: 'text', text: value }],
+      },
+      async execute(args) {
+        const wanted = String(args.name ?? '').trim()
+        if (!wanted) return 'ERROR: name is required.'
+
+        const skills = buildIndex(config, false)
+        if (skills.length === 0) {
+          const roots = (config.roots ?? []).map(expand).join(', ')
+          return `No skills indexed. Checked roots: ${roots || '(none configured)'}`
+        }
+
+        const key = wanted.toLowerCase()
+        const hit =
+          skills.find((s) => s.name.toLowerCase() === key) ??
+          skills.find((s) => s.folder.toLowerCase() === key) ??
+          skills.find((s) => s.name.toLowerCase().includes(key)) ??
+          skills.find((s) => s.folder.toLowerCase().includes(key))
+        if (!hit) {
+          return (
+            `No skill named "${wanted}" among ${skills.length} indexed skills.\n` +
+            'Call skill_search with keywords to find it first.'
+          )
+        }
+
+        let text
+        try {
+          text = fs.readFileSync(hit.path, 'utf8')
+        } catch (e) {
+          return `ERROR: cannot read ${hit.path}: ${e.message}`
+        }
+        recordUsage(hit.name)
+
+        const MAX = 40000
+        const body =
+          text.length > MAX
+            ? text.slice(0, MAX) + `\n\n… truncated (${text.length} chars total); full text at ${hit.path}`
+            : text
+        return `# ${hit.name}\ncategory: ${hit.category}\npath: ${hit.path}\n\n${body}`
+      },
+    }),
+  )
+}
+
 export function apply(ctx, config) {
   registerSearch(ctx, config)
+  registerRead(ctx, config)
   registerCatalog(ctx, config)
 }
