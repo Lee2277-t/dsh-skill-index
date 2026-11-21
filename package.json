@@ -1,0 +1,31 @@
+{
+  "name": "dsh-skill-index",
+  "version": "1.0.0",
+  "description": "Search a local agent-skill library from inside the Harness: keyword ranking over SKILL.md frontmatter, with block-scalar parsing and category awareness.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": ["dsh-plugin", "skills", "search", "agent"],
+  "license": "AGPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Lee2277-t/dsh-skill-index.git"
+  }
+}

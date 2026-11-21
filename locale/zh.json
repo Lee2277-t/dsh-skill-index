@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "技能检索",
+    "description": "在 Harness 里检索本机技能库。新增 skill_search 与 skill_catalog 两个工具，让 agent 找得到没进系统提示的技能。"
+  }
+}

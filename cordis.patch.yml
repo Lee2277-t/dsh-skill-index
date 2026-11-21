@@ -1,0 +1,7 @@
+# dsh-skill-index bundle patch: mounts the plugin into the host profile.
+- insert:
+    - id: skill-index
+      name: 'dsh-skill-index'
+      config:
+        roots:
+          - '~/.skills'
