@@ -143,10 +143,12 @@ node eval/audit-fields.mjs   # 复核 when-not-to-use 字段
 | `refreshSeconds` | 300 | 索引缓存时长 |
 | `autoHint` | true | 关掉自动提示 |
 | `autoHintMinScore` | 14 | 自动提示的分数门槛 |
+| `followLinks` | true | 是否跟随技能库内部的目录软链 |
 
 ## 索引行为
 
-- 跟随目录软链（用 junction 组织的技能库能正确索引），并做环检测。
+- 跟随目录软链（用 junction 组织的技能库能正确索引），并做环检测；`followLinks: false` 可关掉。
+  跟随有正当用途，但也意味着库里的链接可以指到库外——敏感环境建议关闭。
 - 去重键是 `name + folder`：只按名字去重会让同名但不同目录的技能静默消失。
 - frontmatter 不按行数截断——头部很长的技能不会退化成"没有描述"。
 - 索引缓存按 roots 分键：同一进程挂多份时不会拿错库。
@@ -157,6 +159,8 @@ node eval/audit-fields.mjs   # 复核 when-not-to-use 字段
 `<home>/.skill-hub/usage.json` 记读取次数，用于让读过的技能排前面（最多 +120%，十次封顶）。
 
 按 mtime 判失效：删掉文件或别的进程改过都能立刻生效。删掉文件就回到原始排序。
+写入是「重读 → 合并 → 临时文件 → rename」，多进程同时读不会互相覆盖；
+文件坏掉会先备份成 `usage.json.bad-<时间戳>` 再当空表，不会静默清空历史。
 
 ## when-not-to-use
 
