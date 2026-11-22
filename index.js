@@ -687,7 +687,12 @@ function termIdf(term, skills) {
     if (hay.includes(needle)) df++
     if (df > 60) break
   }
-  return Math.log(1 + skills.length / (1 + df))
+  const raw = Math.log(1 + skills.length / (1 + df))
+  // 库里只有个位数技能时，每个词都"出现在唯一的文档里"，raw 很小，
+  // 被 0.25 的地板按住——描述怎么命中都只有一分。
+  // 小库抬地板；30 个技能以上维持原样，大库的排序一个字节都不动。
+  const floor = skills.length >= 30 ? 0.25 : 1.2
+  return Math.min(2.2, Math.max(floor, raw / 1.6))
 }
 
 // 自述是"合集/入口/枢纽"的技能，多半是把人引到别的技能去，自己不做这件事。
@@ -713,7 +718,7 @@ function score(skill, terms, idfMap, usage) {
     if (cat.includes(w)) total += 4 * weight
     // 描述/标题/「不适合」里的命中按稀有度打折：「清理」这种词不该压过「对账」
     const idf = idfMap.get(w) ?? 1.5
-    const damp = Math.min(2.2, Math.max(0.25, idf / 1.6))
+    const damp = idf
     if (desc.includes(w)) total += 3 * weight * damp
     if (heads.includes(w)) total += 2 * weight * damp
     if (notFor.includes(w)) total += 1 * weight * damp
@@ -745,7 +750,7 @@ function scoreBody(skill, terms, idfMap) {
     const at = body.indexOf(w)
     if (at < 0) continue
     const idf = idfMap.get(w) ?? 1.5
-    extra += 3 * weight * Math.min(2.2, Math.max(0.25, idf / 1.6))
+    extra += 3 * weight * idf
     matched++
     longest = Math.max(longest, w.length)
     // 开头 2000 字内出现，或全文出现两次以上，才算"这条技能真在讲这个"

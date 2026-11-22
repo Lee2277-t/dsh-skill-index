@@ -150,6 +150,23 @@ node eval/audit-fields.mjs   # 复核 when-not-to-use 字段
 
 所以它划算的前提是**探询比**——一场活里"看了没用"超过三次，才回本。
 
+## 三分钟上手
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup.ps1
+```
+
+它会列出**插件会去哪些目录找技能**、现在找到了几个，然后：
+
+- 已经有技能 → 告诉你数量，直接用
+- 一个都没有 → 在 `~/.skills` 放一个能跑通的示例技能（`examples/mini-stats`）
+
+重复运行是安全的，不会覆盖你已有的目录。然后试一句：
+
+```
+skill_search({ query: "统计代码行数" })
+```
+
 ## 装上就有东西可查
 
 不配置也能用：默认会扫描这些位置，**存在的才扫，缺的静默跳过**——
