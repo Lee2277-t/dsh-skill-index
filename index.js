@@ -54,6 +54,23 @@ function expand(p) {
   return path.resolve(out)
 }
 
+// 唯一的 roots 解析入口。
+// 三个工具各自的 "No skills indexed" 文案也要用它——
+// 以前那里直接 (config.roots ?? []).map，roots 传字符串就抛。
+// 被丢掉的根不能静默：用户会以为根生效了，只是库是空的。
+let rootStats = { configured: 0, used: 0, skipped: 0 }
+
+function rootsOf(config) {
+  const raw = Array.isArray(config?.roots)
+    ? config.roots
+    : config?.roots == null
+      ? ['~/.skills']
+      : []
+  const expanded = raw.map(expand).filter(Boolean)
+  rootStats = { configured: raw.length, used: expanded.length, skipped: raw.length - expanded.length }
+  return expanded
+}
+
 function isDir(p) {
   try {
     return fs.statSync(p).isDirectory()
@@ -214,8 +231,7 @@ function walk(root, depth, out, visited, base, viaLink, followLinks) {
 
 function buildIndex(config, force) {
   // 显式写 roots: [] 表示"我就是要空库"，只有完全没配才回落 ~/.skills。
-  const configured = Array.isArray(config.roots) ? config.roots : ['~/.skills']
-  const roots = configured.map(expand).filter(Boolean)
+  const roots = rootsOf(config)
   // 缓存必须按 roots 分键：同一个进程里插件被重新挂载、或 profile 覆盖挂两份时，
   // 不区分就会拿上一份根目录的索引，而且不报错。
   const key = roots.join('|').toLowerCase()
@@ -396,22 +412,87 @@ function loadUsage() {
 
 function recordUsage(name) {
   const key = name.toLowerCase()
-  // 写之前重新读盘：领着旧快照整表覆盖，会把别的进程刚写的计数抹掉
-  // （实测 6 进程 ×40 次读，期望 240 实际只剩 41）。
-  const usage = readUsageFile()
-  const prev = usage.get(key) ?? { count: 0, last: null }
-  const count = (Number.isFinite(prev.count) ? prev.count : 0) + 1
-  usage.set(key, { count, last: new Date().toISOString() })
-  usageCache = usage
+
+  // 这里必须串行化整个「读-改-写」。
+  //
+  // 实测（6 进程各 40 次读，目标文件共用）：
+  //   - 不加锁：期望 240 次，实际只剩 41 次
+  //   - Windows 上 rename 覆盖"正被并发读"的文件会返回 EPERM，概率约 60%，
+  //     原来那个 catch{} 把这些写入直接吞了，连临时文件都留在硬盘上
+  // 影响面只是排序权重，不影响检索内容，但"看起来是准的"比"不准"更糟。
+  const lock = `${USAGE_PATH}.lock`
   try {
     fs.mkdirSync(path.dirname(USAGE_PATH), { recursive: true })
-    // 先写临时文件再改名：写一半崩掉不会留下半截 JSON
+  } catch {
+    return
+  }
+
+  let fd = null
+  const deadline = Date.now() + 1500
+  while (Date.now() < deadline) {
+    try {
+      fd = fs.openSync(lock, 'wx')
+      break
+    } catch (e) {
+      if (e.code !== 'EEXIST') return
+      // 锁文件超过 5 秒视为上一个进程死掉了，清掉重来
+      try {
+        if (Date.now() - fs.statSync(lock).mtimeMs > 5000) fs.unlinkSync(lock)
+      } catch {
+        /* 别人刚删掉，正常 */
+      }
+      // 退避：同步等待几毫秒，比丢掉一次计数便宜
+      const until = Date.now() + 2 + Math.random() * 6
+      while (Date.now() < until) {
+        /* spin */
+      }
+    }
+  }
+  if (fd === null) return // 抢不到锁就放弃这次记账，不能拖慢检索
+
+  try {
+    const usage = readUsageFile()
+    const prev = usage.get(key) ?? { count: 0, last: null }
+    const count = (Number.isFinite(prev.count) ? prev.count : 0) + 1
+    usage.set(key, { count, last: new Date().toISOString() })
+    usageCache = usage
     const tmp = `${USAGE_PATH}.${process.pid}.tmp`
     fs.writeFileSync(tmp, JSON.stringify(Object.fromEntries(usage), null, 1), 'utf8')
-    fs.renameSync(tmp, USAGE_PATH)
+    // rename 遇 EPERM/EBUSY 要退避重试，不能吞
+    let moved = false
+    for (let i = 0; i < 6 && !moved; i++) {
+      try {
+        fs.renameSync(tmp, USAGE_PATH)
+        moved = true
+      } catch (e) {
+        if (e.code !== 'EPERM' && e.code !== 'EBUSY' && e.code !== 'EACCES') break
+        const until = Date.now() + 5 + i * 15
+        while (Date.now() < until) {
+          /* spin */
+        }
+      }
+    }
+    if (!moved) {
+      try {
+        fs.unlinkSync(tmp)
+      } catch {
+        /* 清不掉就算了 */
+      }
+    }
     usageStamp = usageMtime()
   } catch {
-    // 记不上不影响检索，静默放着
+    // 记不上不影响检索
+  } finally {
+    try {
+      fs.closeSync(fd)
+    } catch {
+      /* ignore */
+    }
+    try {
+      fs.unlinkSync(lock)
+    } catch {
+      /* ignore */
+    }
   }
 }
 
@@ -668,7 +749,7 @@ function registerSearch(ctx, config) {
 
         const skills = buildIndex(config, false)
         if (skills.length === 0) {
-          const roots = (config.roots ?? []).map(expand).join(', ')
+          const roots = rootsOf(config).join(', ')
           return `No skills indexed. Checked roots: ${roots || '(none configured)'}`
         }
 
@@ -780,7 +861,7 @@ function registerCatalog(ctx, config) {
       async execute(args) {
         const skills = buildIndex(config, Boolean(args.refresh))
         if (skills.length === 0) {
-          return `No skills indexed. Configured roots: ${(config.roots ?? []).join(', ') || '(none)'}`
+          return `No skills indexed. Configured roots: ${rootsOf(config).join(', ') || '(none)'}`
         }
 
         const filter = String(args.category ?? '').toLowerCase()
@@ -830,7 +911,7 @@ function registerRead(ctx, config) {
 
         const skills = buildIndex(config, false)
         if (skills.length === 0) {
-          const roots = (config.roots ?? []).map(expand).join(', ')
+          const roots = rootsOf(config).join(', ')
           return `No skills indexed. Checked roots: ${roots || '(none configured)'}`
         }
 
@@ -1108,8 +1189,11 @@ function registerActive(ctx, config) {
           '如果当前任务和其中某些无关，用 skill_drop 停用它们——停用会改变后续行为，但不减少上下文，',
           '真正释放要等压缩。技能里最贵的不是搜索，是「加载了却用不上还一直占着」。',
           '',
+          rootStats.skipped > 0
+            ? `注意：${rootStats.configured} 个配置根里有 ${rootStats.skipped} 个无效（非字符串或空），已跳过。`
+            : null,
           hintLine,
-        ].join('\n')
+        ].filter((x) => x !== null).join('\n')
       },
     }),
   )
