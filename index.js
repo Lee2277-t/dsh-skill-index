@@ -1095,8 +1095,13 @@ function registerAutoHint(ctx, config) {
         // stock-research-report-expert——它们只是"出现过这些词"，不是要做这件事。
         const pasteLike = /\`\`\`/.test(text) || /\n#{1,3}\s/.test(text) || /\n\|\s*-{3,}/.test(text)
         if (pasteLike && text.length > 400) return decision
+        // 请求词必须中英都认：只匹配中文祈使词时，
+        // 一段 300 字符的英文需求会被当成"不是请求"直接吞掉（实测确实发生了）。
         const requestLike =
           /(帮我|帮忙|请|麻烦|需要|想要|怎么|如何|能不能|可不可以|做一个|写一个|生成|检查|审查|优化|修复|改成|整理|分析|看下|看看)/.test(
+            text,
+          ) ||
+          /\b(help|please|could you|can you|would you|how (do|to|can|should)|write|create|make|build|fix|check|review|optimi[sz]e|generate|refactor|analy[sz]e|set ?up|clean ?up|look at)\b/i.test(
             text,
           )
         if (!requestLike && text.length > 200) return decision
