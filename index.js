@@ -678,7 +678,9 @@ function registerSearch(ctx, config) {
 
         // 头名 38 分、后面跟着 2 分的条目，那不是候选，是噪音——
         // 每条要花 30 多个 token，还稀释判断。低于头名 20% 的直接不显示。
-        if (ranked.length > 1) {
+        // 只在没显式指定 limit 时截断：显式要 20 条的人，不该只拿到 8 条。
+        // （契约测试发现 limit=20 时召回被砍，而 README 没写这条收缩。）
+        if (ranked.length > 1 && args.limit === undefined) {
           const top = ranked[0]
           const floor = Math.max(6, top.score * 0.2)
           const kept = ranked.filter((r) => r.score >= floor)
@@ -838,7 +840,7 @@ function registerRead(ctx, config) {
                 )
           if (partial.length > 1) {
             const names = partial.slice(0, 8).map((s) => s.name).join(', ')
-            return `"\${wanted}" 匹配到多个技能：\${names}。请用完整名字。`
+            return `"${wanted}" 匹配到多个技能：${names}。请用完整名字。`
           }
           hit = partial[0]
         }
@@ -1059,6 +1061,8 @@ function registerActive(ctx, config) {
           '',
           '如果当前任务和其中某些无关，用 skill_drop 停用它们——停用会改变后续行为，但不减少上下文，',
           '真正释放要等压缩。技能里最贵的不是搜索，是「加载了却用不上还一直占着」。',
+          '',
+          hintLine,
         ].join('\n')
       },
     }),

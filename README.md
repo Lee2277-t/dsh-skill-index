@@ -23,6 +23,8 @@ Matched 2 of 173 indexed skills for "小程序 隐私":
 - `·族:seo(25)` 表示这个技能是 25 个 SEO 子技能之一，不是独立工具。
 - 不给路径：读要走 `skill_read`，那才会记账。
 - 命中不足时只报名字，不铺描述。
+- 默认会滤掉低于头名 20% 的条目（头名 38 分后面跟 2 分的不是候选，是噪音）；
+  **显式传了 `limit` 就不滤**，要 20 条就给到 20 条。
 
 ### `skill_read`
 
@@ -47,7 +49,11 @@ Matched 2 of 173 indexed skills for "小程序 隐私":
 要照它做，调 skill_read({ name: "…", mode: "full" }) 读全文。
 ```
 
-`mode: "full"` 才载入整份 SKILL.md。名字有歧义时拒绝猜，直接列出候选。
+`mode: "full"` 才载入整份 SKILL.md。名字有歧义时拒绝猜，直接列出候选：
+
+```
+"ppt" 匹配到多个技能：guizang-ppt-skill, ppt-master, workbuddy-pptx。请用完整名字。
+```
 
 ### `skill_active`
 
@@ -115,7 +121,7 @@ node eval/audit-fields.mjs   # 复核 when-not-to-use 字段
 | hit@1 | 90.5% |
 | hit@3 | 97.6% |
 | MRR | 0.942 |
-| 单次检索输出 | ≈257 tokens |
+| 单次检索输出 | ≈256 tokens（评测显式传 limit；真实使用不传时约 212） |
 
 评测**只覆盖元数据路径**，正文兜底、自动提示、软链库这类路径不在里面——它们由独立的破坏性测试覆盖。
 
@@ -125,7 +131,7 @@ node eval/audit-fields.mjs   # 复核 when-not-to-use 字段
 
 | 动作 | 成本 |
 |---|---|
-| 检索一次 | ≈257 tokens |
+| 检索一次 | ≈212 tokens（默认，会滤掉弱条目）/ ≈256（显式给 limit） |
 | 读 digest | ≈300 tokens |
 | 读全文 | ≈4,500 tokens（12 个样本均值） |
 
