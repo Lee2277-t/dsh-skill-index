@@ -26,9 +26,21 @@ export const inject = ['tools']
 const MAX_FILES = 3000
 const MAX_DEPTH = 5
 
+// 装上就能用：大多数人已经把技能放在这些位置之一了，不该逼他们先读配置。
+// 只取存在的目录，缺的静默跳过——默认值不该在界面上刷"根目录无效"。
+const DEFAULT_ROOTS = [
+  '~/.skills',
+  '~/.claude/skills',
+  '~/.codex/skills',
+  '~/.agents/skills',
+  '~/.config/skills',
+  './skills',
+  './.agents/skills',
+]
+
 export const Config = Schema.object({
   roots: Schema.array(Schema.string())
-    .default(['~/.skills'])
+    .default(DEFAULT_ROOTS)
     .description('技能库根目录。支持 ~ 与 $ENV 变量；可以给多个。'),
   maxResults: Schema.number().default(8).description('搜索结果条数上限。'),
   refreshSeconds: Schema.number().default(300).description('索引缓存有效期（秒）；0 表示每次都重建。'),
@@ -64,11 +76,37 @@ function rootsOf(config) {
   const raw = Array.isArray(config?.roots)
     ? config.roots
     : config?.roots == null
-      ? ['~/.skills']
+      ? DEFAULT_ROOTS
       : []
-  const expanded = raw.map(expand).filter(Boolean)
-  rootStats = { configured: raw.length, used: expanded.length, skipped: raw.length - expanded.length }
+  const fromDefaults = config?.roots == null
+  let expanded = raw.map(expand).filter(Boolean)
+  // 默认值里不存在的目录是正常的（谁也不会同时装四家的技能），
+  // 静默丢掉；用户自己写的根无效才值得说。
+  if (fromDefaults) expanded = expanded.filter(isDir)
+  const skipped = fromDefaults ? 0 : raw.length - expanded.length
+  rootStats = { configured: raw.length, used: expanded.length, skipped, defaults: fromDefaults }
   return expanded
+}
+
+// 空状态是别人第一次运行时的唯一指引，必须能照着做。
+// "(none configured)" 只是陈述事实；新用户需要知道的是"把 roots 指到哪"。
+function emptyStateText(roots, linkNote = '') {
+  // 调用方有的传数组、有的传 join 过的字符串；两种都得认。
+  const list = Array.isArray(roots)
+    ? roots
+    : String(roots ?? '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+  if (list.length) {
+    return `No skills indexed under: ${list.join(', ')}${linkNote}`
+  }
+  if (rootStats.defaults) {
+    return 'No skills indexed — none of the usual skill folders exist on this machine. ' +
+      'Point roots at any folder that contains SKILL.md files, for example ' +
+      'roots: ["~/my-skills"], then call this again.'
+  }
+  return 'No skills indexed. Configured roots: (none)' + linkNote
 }
 
 function isDir(p) {
@@ -766,7 +804,7 @@ function registerSearch(ctx, config) {
             rootStats.linksSkipped > 0
               ? ` 检测到 ${rootStats.linksSkipped} 个软链目录已跳过（followLinks: false）。`
               : ''
-          return `No skills indexed. Checked roots: ${roots || '(none configured)'}${linkNote}`
+          return emptyStateText(roots, linkNote)
         }
 
         // limit 传字符串/NaN/负数都不能让它变成 Infinity 或 0
@@ -877,7 +915,7 @@ function registerCatalog(ctx, config) {
       async execute(args) {
         const skills = buildIndex(config, Boolean(args.refresh))
         if (skills.length === 0) {
-          return `No skills indexed. Configured roots: ${rootsOf(config).join(', ') || '(none)'}`
+          return emptyStateText(rootsOf(config))
         }
 
         const filter = String(args.category ?? '').toLowerCase()
@@ -927,8 +965,7 @@ function registerRead(ctx, config) {
 
         const skills = buildIndex(config, false)
         if (skills.length === 0) {
-          const roots = rootsOf(config).join(', ')
-          return `No skills indexed. Checked roots: ${roots || '(none configured)'}`
+          return emptyStateText(rootsOf(config))
         }
 
         // 支持 "name @folder" 和 "name（folder）" 两种写法：

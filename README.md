@@ -150,11 +150,37 @@ node eval/audit-fields.mjs   # 复核 when-not-to-use 字段
 
 所以它划算的前提是**探询比**——一场活里"看了没用"超过三次，才回本。
 
+## 装上就有东西可查
+
+不配置也能用：默认会扫描这些位置，**存在的才扫，缺的静默跳过**——
+
+```
+~/.skills
+~/.claude/skills
+~/.codex/skills
+~/.agents/skills
+~/.config/skills
+./skills
+./.agents/skills
+```
+
+前四个是常见的技能安放位置（Claude、Codex、各种 agent 客户端）。任一目录里放一个
+含 `name` / `description` 的 `SKILL.md`，就能被检索到。想用别的位置就配 `roots`：
+
+```yaml
+roots:
+  - ~/我的技能
+  - D:/work/skills
+```
+
+一个都没有时，工具会直接告诉你「把这些位置找过了、都没有，请把 roots 指到一个含
+`SKILL.md` 的目录」，而不是甩一句 `(none configured)` 让你猜。
+
 ## 配置
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `roots` | `["~/.skills"]` | 技能库根目录，可多个 |
+| `roots` | 见下 | 技能库根目录，可多个 |
 | `maxResults` | 8 | 检索默认返回条数 |
 | `refreshSeconds` | 300 | 索引缓存时长 |
 | `autoHint` | true | 关掉自动提示 |
