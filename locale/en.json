@@ -1,6 +1,6 @@
 {
     "meta":  {
                  "title":  "Skill index",
-                 "description":  "Check the local agent-skill library by keyword, read a skill by name, and rank the skills you actually use higher."
+                 "description":  "Search the local skill library by keyword and read a skill by name. Keeps a per-session ledger of loaded skills with their context cost, so the agent can drop what no longer applies instead of carrying it to the end."
              }
 }

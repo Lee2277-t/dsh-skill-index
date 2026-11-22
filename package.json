@@ -1,7 +1,7 @@
 {
     "name":  "dsh-skill-index",
-    "version":  "1.1.0",
-    "description":  "Search a local agent-skill library by keyword and read a skill by name. Reads are recorded so search ranks skills you actually use higher.",
+    "version":  "1.2.0",
+    "description":  "Search a local agent-skill library, read a skill by name, and keep a per-session ledger of what is loaded so the agent can drop skills that no longer apply.",
     "type":  "module",
     "main":  "index.js",
     "exports":  {

@@ -8,6 +8,8 @@
 //   skill_search  按关键词在多根源码里检索，返回命中技能的名称、描述与路径
 //   skill_read    读某个技能的 SKILL.md，并记一次使用
 //   skill_catalog 按分类列出全部技能（用于「我都有什么」这类问题）
+//   skill_active  看本会话加载了哪些技能、各占多少 token
+//   skill_drop    判定某个已加载技能不再适用时停用它
 //
 // 记账的意义：检索排序会按你真正读过的技能加权。第一次搜出来的第 5 名，
 // 读过三次之后应该排在前面——它已经被验证过对这类任务有用。
@@ -215,6 +217,34 @@ function recordUsage(name) {
 
 // ---------------------------------------------------------------- 检索
 
+// ---------------------------------------------------------------- 会话级活跃技能
+
+// 按会话记「这次读了哪些技能」。key 是 agent.id，拿不到就退化成一个全局桶。
+// 记的是判断依据（token 成本、读的时间），不是内容——内容已经进了上下文，本插件动不了它。
+const activeBySession = new Map()
+
+function sessionKey(exec) {
+  const id = exec?.agent?.id
+  return id ? String(id) : 'global'
+}
+
+function activeOf(exec) {
+  const key = sessionKey(exec)
+  if (!activeBySession.has(key)) activeBySession.set(key, new Map())
+  return activeBySession.get(key)
+}
+
+function estimateTokens(text) {
+  return Math.round(text.length / 1.6)
+}
+
+function activeLine(exec) {
+  const active = activeOf(exec)
+  if (active.size === 0) return null
+  const parts = [...active.entries()].map(([name, info]) => `${name}(${(info.tokens / 1000).toFixed(1)}k)`)
+  return `已加载：${parts.join('、')} —— 若本次任务与它们无关，先调 skill_drop 停用，不要沿用它的流程。`
+}
+
 function score(skill, words, usage) {
   const name = skill.name.toLowerCase()
   const folder = skill.folder.toLowerCase()
@@ -272,7 +302,7 @@ function registerSearch(ctx, config) {
         schema: { type: 'string' },
         render: (_args, value) => [{ type: 'text', text: value }],
       },
-      async execute(args) {
+      async execute(args, exec) {
         const words = String(args.query ?? '')
           .split(/\s+/)
           .filter(Boolean)
@@ -299,7 +329,9 @@ function registerSearch(ctx, config) {
         }
 
         const header = `Matched ${ranked.length} of ${skills.length} indexed skills for "${words.join(' ')}":`
-        return [header, '', ...ranked.map((r) => formatHit(r.skill, r.score, usage.get(r.skill.name.toLowerCase())?.count ?? 0))].join('\n')
+        const ledger = activeLine(exec)
+        const body = ranked.map((r) => formatHit(r.skill, r.score, usage.get(r.skill.name.toLowerCase())?.count ?? 0))
+        return [ledger ? `[技能台账] ${ledger}` : null, header, '', ...body].filter((x) => x !== null).join('\n')
       },
     }),
   )
@@ -375,7 +407,7 @@ function registerRead(ctx, config) {
         schema: { type: 'string' },
         render: (_args, value) => [{ type: 'text', text: value }],
       },
-      async execute(args) {
+      async execute(args, exec) {
         const wanted = String(args.name ?? '').trim()
         if (!wanted) return 'ERROR: name is required.'
 
@@ -405,6 +437,7 @@ function registerRead(ctx, config) {
           return `ERROR: cannot read ${hit.path}: ${e.message}`
         }
         recordUsage(hit.name)
+        activeOf(exec).set(hit.name, { tokens: estimateTokens(text), at: Date.now(), category: hit.category })
 
         const MAX = 40000
         const body =
@@ -417,8 +450,88 @@ function registerRead(ctx, config) {
   )
 }
 
+// ---------------------------------------------------------------- 停用与台账
+
+function registerDrop(ctx) {
+  ctx.tools.register(
+    defineTool({
+      name: 'skill_drop',
+      description:
+        'Mark a previously read skill as no longer applicable to the current task. Call this when the ' +
+        'task has changed and the skill you loaded earlier no longer applies: it removes the skill ' +
+        'from this session\'s active set and stops it being suggested again. Its text stays in the ' +
+        'context until compaction, but nothing should follow it after this call.',
+      parameters: {
+        name: { type: 'string', required: true, description: '要停用的技能名，大小写不敏感。' },
+        reason: { type: 'string', description: '一句话说明为什么不再适用（用于台账）。' },
+      },
+      output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+      async execute(args, exec) {
+        const wanted = String(args.name ?? '').trim()
+        if (!wanted) return 'ERROR: name is required.'
+        const active = activeOf(exec)
+        const key = [...active.keys()].find((k) => k.toLowerCase() === wanted.toLowerCase())
+        if (!key) {
+          const list = active.size ? [...active.keys()].join(', ') : '(空)'
+          return `当前会话没有加载过 "${wanted}"。已加载：${list}`
+        }
+        const info = active.get(key)
+        active.delete(key)
+        const rest = active.size ? `仍在用：${[...active.keys()].join(', ')}` : '当前会话已无活跃技能。'
+        return [
+          `已停用 ${key}（${(info.tokens / 1000).toFixed(1)}k tokens）。`,
+          `从现在起不要再用它的流程、清单或判断标准。${args.reason ? `原因：${args.reason}` : ''}`,
+          rest,
+          '',
+          `注意：它的正文仍在上下文里，只有压缩才会真正释放这 ${(info.tokens / 1000).toFixed(1)}k token。`,
+          '这一步改变的是行为，不是上下文体积。',
+        ].join('\n')
+      },
+    }),
+  )
+}
+
+function registerActive(ctx) {
+  ctx.tools.register(
+    defineTool({
+      name: 'skill_active',
+      description:
+        'Show the skills loaded in this session, with the context cost of each and how long ago it ' +
+        'was read. Use it before starting a different task to decide which ones still apply; then ' +
+        'call skill_drop for the ones that do not.',
+      parameters: {},
+      output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+      async execute(_args, exec) {
+        const active = activeOf(exec)
+        if (active.size === 0) {
+          return '本会话没有加载过技能。当前任务可以直接做，或先 skill_search 看有没有适用的。'
+        }
+        const now = Date.now()
+        const rows = [...active.entries()]
+          .sort((a, b) => b[1].at - a[1].at)
+          .map(([name, info]) => {
+            const mins = Math.round((now - info.at) / 60000)
+            const when = mins < 1 ? '刚刚' : mins < 60 ? `${mins} 分钟前` : `${Math.round(mins / 60)} 小时前`
+            return `  ${name}  [${info.category}]  ${(info.tokens / 1000).toFixed(1)}k tokens · ${when}`
+          })
+        const total = [...active.values()].reduce((s, i) => s + i.tokens, 0)
+        return [
+          `本会话加载了 ${active.size} 个技能，合计约 ${(total / 1000).toFixed(1)}k tokens：`,
+          '',
+          ...rows,
+          '',
+          '如果当前任务和其中某些无关，用 skill_drop 停用它们——停用会改变后续行为，但不减少上下文，',
+          '真正释放要等压缩。技能里最贵的不是搜索，是「加载了却用不上还一直占着」。',
+        ].join('\n')
+      },
+    }),
+  )
+}
+
 export function apply(ctx, config) {
   registerSearch(ctx, config)
   registerRead(ctx, config)
   registerCatalog(ctx, config)
+  registerActive(ctx)
+  registerDrop(ctx)
 }
