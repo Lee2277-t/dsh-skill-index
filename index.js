@@ -322,7 +322,9 @@ function buildDigest(skill, maxChars = 1400) {
   const heads = skill.headings ?? []
 
   // 逐级压缩：先砍文件清单，再砍章节，最后才动描述。
-  for (const refCap of [refs.length, 6, 0]) {
+  // 文件清单默认只列 8 个：22 行的路径列表不是"要不要用"的判断材料，
+  // 它只是告诉你有哪些附录。剩下的用一句"还有 N 个"带过。
+  for (const refCap of [Math.min(refs.length, 8), 5, 0]) {
     for (const headCap of [heads.length, 8, 0]) {
       const parts = [...head]
       if (headCap) parts.push('', '## 结构', heads.slice(0, headCap).map((h) => `- ${h}`).join('\n'))
