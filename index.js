@@ -1089,6 +1089,18 @@ function registerAutoHint(ctx, config) {
         if (decision.kind === 'reject' || payload.signal?.aborted || payload.step !== 1) return decision
 
         const text = messageText(decision.messages)
+
+        // 粘贴的内容不是任务请求。
+        // 实测：贴一段代码会提示 music-mv，贴一份 markdown 报告会提示
+        // stock-research-report-expert——它们只是"出现过这些词"，不是要做这件事。
+        const pasteLike = /\`\`\`/.test(text) || /\n#{1,3}\s/.test(text) || /\n\|\s*-{3,}/.test(text)
+        if (pasteLike && text.length > 400) return decision
+        const requestLike =
+          /(帮我|帮忙|请|麻烦|需要|想要|怎么|如何|能不能|可不可以|做一个|写一个|生成|检查|审查|优化|修复|改成|整理|分析|看下|看看)/.test(
+            text,
+          )
+        if (!requestLike && text.length > 200) return decision
+
         // 下界不能是 4：中文最常用的就是 2-3 字（字体、水印、排版、小程序），
         // 卡在 4 等于把最常见的问法全排除了。
         if (text.trim().length < 2 || CONTINUATIONS.test(text.trim())) return decision
@@ -1105,8 +1117,10 @@ function registerAutoHint(ctx, config) {
           .filter((r) => r.score > 0)
           .sort((a, b) => b.score - a.score)[0]
 
+        // 长文本里关键词多，误报率天然更高，门槛跟着抬。
         const minScore = config.autoHintMinScore ?? 14
-        if (!best || best.score < minScore) return decision
+        const need = text.length > 400 ? Math.round(minScore * 1.5) : minScore
+        if (!best || best.score < need) return decision
 
         const seen = hinted.get(sessionId) ?? new Set()
         if (seen.has(best.skill.name)) return decision
