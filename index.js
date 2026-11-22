@@ -397,20 +397,15 @@ function registerSearch(ctx, config) {
     defineTool({
       name: 'skill_search',
       description:
-        'Search the local agent-skill library by keyword and return ranked matches with the exact ' +
-        'SKILL.md path of each. Use this before improvising a workflow: if a skill already covers ' +
-        'the task, read its SKILL.md and follow it. Works across every configured skills root, not ' +
-        'just the ones this agent was started with.',
+        'Search the local skill library by keyword. Hits come back one line each with a context-cost ' +
+        'label; weak matches are reported by name only. Cheap — run it at every task boundary.',
       parameters: {
         query: {
           type: 'string',
           required: true,
-          description: 'Keywords, space separated. Chinese and English both work, e.g. "PPT 排版" or "code review".',
+          description: 'Keywords, space separated. Chinese and English both work.',
         },
-        limit: {
-          type: 'number',
-          description: 'Maximum hits to return. Defaults to the configured maxResults.',
-        },
+        limit: { type: 'number', description: 'Max hits (default from config).' },
       },
       output: {
         schema: { type: 'string' },
@@ -497,9 +492,7 @@ function registerCatalog(ctx, config) {
   ctx.tools.register(
     defineTool({
       name: 'skill_catalog',
-      description:
-        'List the local agent-skill library grouped by category, with a one-line summary per skill. ' +
-        'Use it to see what is available when you do not know which keywords to search for.',
+      description: 'List every skill grouped by category with a one-line summary. Use when keywords are unknown.',
       parameters: {
         category: {
           type: 'string',
@@ -549,22 +542,11 @@ function registerRead(ctx, config) {
     defineTool({
       name: 'skill_read',
       description:
-        "Read a skill's SKILL.md by name and return its text. Records the read so later skill_search " +
-        'calls rank skills you have actually used higher — prefer this over reading the path by hand, ' +
-        'since it is the same content and it keeps the ranking honest.',
+        "Read a skill by name. Default 'digest' is ~300 tokens (when-not-to-use, description, section " +
+        "headings, bundled files); 'full' loads the whole SKILL.md (~4k). Read the digest first.",
       parameters: {
-        name: {
-          type: 'string',
-          required: true,
-          description: 'Skill name or its folder name, case insensitive.',
-        },
-        mode: {
-          type: 'string',
-          description:
-            'digest (default, ~300 tokens: description, section headings, bundled files) or full ' +
-            '(the whole SKILL.md, a median ~3,850 tokens). Use digest to decide whether the skill ' +
-            'applies; switch to full only when you are going to follow it.',
-        },
+        name: { type: 'string', required: true, description: 'Skill name or folder name, case insensitive.' },
+        mode: { type: 'string', description: "'digest' (default) or 'full'." },
       },
       output: {
         schema: { type: 'string' },
@@ -627,10 +609,8 @@ function registerDrop(ctx) {
     defineTool({
       name: 'skill_drop',
       description:
-        'Mark a previously read skill as no longer applicable to the current task. Call this when the ' +
-        'task has changed and the skill you loaded earlier no longer applies: it removes the skill ' +
-        'from this session\'s active set and stops it being suggested again. Its text stays in the ' +
-        'context until compaction, but nothing should follow it after this call.',
+        'Mark a loaded skill as no longer applicable when the task changes. Stops it being suggested ' +
+        'again; does not free context — only compaction does.',
       parameters: {
         name: { type: 'string', required: true, description: '要停用的技能名，大小写不敏感。' },
         reason: { type: 'string', description: '一句话说明为什么不再适用（用于台账）。' },
@@ -665,10 +645,7 @@ function registerActive(ctx) {
   ctx.tools.register(
     defineTool({
       name: 'skill_active',
-      description:
-        'Show the skills loaded in this session, with the context cost of each and how long ago it ' +
-        'was read. Use it before starting a different task to decide which ones still apply; then ' +
-        'call skill_drop for the ones that do not.',
+      description: 'List skills loaded in this session with their context cost and age.',
       parameters: {},
       output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
       async execute(_args, exec) {

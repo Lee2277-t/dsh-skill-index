@@ -1,6 +1,6 @@
 {
     "name":  "dsh-skill-index",
-    "version":  "1.4.0",
+    "version":  "1.4.1",
     "description":  "Search a local agent-skill library with CJK-aware matching and body-text fallback, read a skill as a cheap digest or in full, and keep a per-session ledger of what is loaded so the agent can drop skills that no longer apply.",
     "type":  "module",
     "main":  "index.js",
