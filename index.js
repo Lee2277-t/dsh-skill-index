@@ -198,6 +198,18 @@ function buildIndex(config, force) {
   const skills = [...byName.values()]
   for (const s of skills) enrich(s)
 
+  // 同名前缀的技能成族（seo-*、better-*、sites-*）。
+  // 20 个 seo-* 逐条列出既费 token，又让人分不清它们是一个套件里的兄弟。
+  const famCount = new Map()
+  for (const s of skills) {
+    const fam = s.name.includes('-') ? s.name.split('-')[0] : ''
+    if (fam) famCount.set(fam, (famCount.get(fam) ?? 0) + 1)
+  }
+  for (const s of skills) {
+    const fam = s.name.includes('-') ? s.name.split('-')[0] : ''
+    s.family = fam && (famCount.get(fam) ?? 0) >= 3 ? { name: fam, count: famCount.get(fam) } : null
+  }
+
   cache = { at: Date.now(), skills }
   return cache.skills
 }
@@ -341,38 +353,125 @@ function activeLine(exec) {
   return `已加载：${parts.join('、')} —— 若本次任务与它们无关，先调 skill_drop 停用，不要沿用它的流程。`
 }
 
-// 中文查询常常不带空格（"去水印"、"字体子集"），整词子串匹配会漏掉
-// 「去AI图片水印」这种名字。补二元组让分词不依赖空格。
+// 库里有相当一部分技能是英文描述（better-*、seo-*、skills/ 下的一批）。
+// 中文查询永远匹配不到，所以要一张小词表做跨语言扩展。
+// 只放高频、歧义小的对，宁缺毋滥。
+const GLOSSARY = {
+  无障碍: ['accessibility', 'a11y', 'aria'],
+  键盘: ['keyboard'],
+  焦点: ['focus'],
+  配色: ['color', 'colour', 'palette'],
+  颜色: ['color', 'colour'],
+  对比度: ['contrast'],
+  排版: ['typography'],
+  布局: ['layout'],
+  间距: ['spacing', 'rhythm'],
+  文案: ['copy', 'writing'],
+  动效: ['motion', 'animation'],
+  图标: ['icon'],
+  组件: ['component'],
+  状态: ['state'],
+  交互: ['interaction'],
+  计划: ['plan', 'planning'],
+  测试: ['test', 'testing'],
+  调试: ['debug', 'debugging'],
+  审查: ['review'],
+  评审: ['review'],
+  提交: ['commit', 'pull request'],
+  分支: ['branch'],
+  技术: ['technical'],
+  抓取: ['crawl', 'crawling'],
+  索引: ['index', 'indexing'],
+  速度: ['speed', 'performance'],
+  性能: ['performance'],
+  安全: ['security'],
+  审计: ['audit'],
+  部署: ['deploy', 'deployment'],
+  测试驱动: ['tdd'],
+  重构: ['refactor'],
+  设计: ['design'],
+  组件库: ['design system'],
+  视频: ['video'],
+  术语: ['jargon', 'plain language'],
+  合同: ['contract'],
+  磁盘: ['storage', 'disk'],
+  清理: ['cleanup', 'clean'],
+  报告: ['report'],
+  论文: ['paper'],
+  翻译: ['translation', 'translate'],
+  水印: ['watermark'],
+  音乐: ['music'],
+  歌曲: ['song']
+}
+
 function queryTerms(words) {
   const terms = []
+  const seen = new Set()
+  // gloss 标记：翻译扩展出来的词是间接证据，命中名字时不能和原词同权
+  const push = (text, weight, gloss = false) => {
+    const k = text + '|' + weight
+    if (seen.has(k)) return
+    seen.add(k)
+    terms.push({ text, weight, gloss })
+  }
   for (const raw of words) {
     const w = raw.toLowerCase()
     if (!w) continue
-    terms.push({ text: w, weight: 1 })
+    push(w, 1)
+    // 中文二元组：让「去水印」能命中「去AI图片水印」
     if (/[\u4e00-\u9fff]/.test(w) && w.length >= 3) {
       for (let i = 0; i < w.length - 1; i++) {
         const bigram = w.slice(i, i + 2)
-        if (/[\u4e00-\u9fff]{2}/.test(bigram)) terms.push({ text: bigram, weight: 0.75 })
+        if (/[\u4e00-\u9fff]{2}/.test(bigram)) push(bigram, 0.75)
       }
+    }
+    // 跨语言扩展：中文词换成英文同义词，权重打折
+    for (const [zh, ens] of Object.entries(GLOSSARY)) {
+      if (w.includes(zh)) for (const en of ens) push(en, 0.7, true)
+    }
+    // 反向：英文查询补中文
+    for (const [zh, ens] of Object.entries(GLOSSARY)) {
+      if (ens.some((en) => w === en || w.includes(en))) push(zh, 0.6, true)
     }
   }
   return terms
 }
 
-function score(skill, words, usage) {
+// 稀有词比常用词更有信息量：「清理」出现在好几条描述里，「对账」只在一个名字里。
+function termIdf(term, skills) {
+  const needle = term.toLowerCase()
+  let df = 0
+  for (const s of skills) {
+    const hay = `${s.name} ${s.description} ${(s.headings ?? []).join(' ')}`.toLowerCase()
+    if (hay.includes(needle)) df++
+    if (df > 60) break
+  }
+  return Math.log(1 + skills.length / (1 + df))
+}
+
+function score(skill, terms, idfMap, usage) {
   const name = skill.name.toLowerCase()
   const folder = skill.folder.toLowerCase()
   const cat = skill.category.toLowerCase()
   const desc = skill.description.toLowerCase()
   const heads = (skill.headings ?? []).join(' ').toLowerCase()
+  const notFor = (skill.notFor ?? '').toLowerCase()
   let total = 0
-  for (const { text: w, weight } of queryTerms(words)) {
-    if (name === w) total += 20 * weight
-    else if (name.includes(w)) total += 10 * weight
+  for (const { text: w, weight, gloss } of terms) {
+    // 名字命中是最强证据；但翻译来的词只算半个证据——
+    // 中文「审查」不该让 review-agent 压过名字里就有「合同」的技能。
+    const nameEq = gloss ? 12 : 20
+    const nameInc = gloss ? 8 : 10
+    if (name === w) total += nameEq * weight
+    else if (name.includes(w)) total += nameInc * weight
     if (folder.includes(w)) total += 6 * weight
     if (cat.includes(w)) total += 4 * weight
-    if (desc.includes(w)) total += 3 * weight
-    if (heads.includes(w)) total += 2 * weight
+    // 描述/标题/「不适合」里的命中按稀有度打折：「清理」这种词不该压过「对账」
+    const idf = idfMap.get(w) ?? 1.5
+    const damp = Math.min(2.2, Math.max(0.25, idf / 1.6))
+    if (desc.includes(w)) total += 3 * weight * damp
+    if (heads.includes(w)) total += 2 * weight * damp
+    if (notFor.includes(w)) total += 1 * weight * damp
   }
   total = Math.round(total)
   if (total === 0) return 0
@@ -387,7 +486,8 @@ function formatHit(s, score, uses, tokens) {
   const desc = s.description.length > 90 ? s.description.slice(0, 87) + '…' : s.description
   const used = uses > 0 ? ` ·用过${uses}次` : ''
   const cost = tokens ? ` ·全文≈${(tokens / 1000).toFixed(1)}k` : ''
-  return `- ${s.name} [${s.category}] ${score}${cost}${used}${desc ? ' — ' + desc : ''}`
+  const fam = s.family ? ` ·族:${s.family.name}(${s.family.count})` : ''
+  return `- ${s.name} [${s.category}] ${score}${cost}${fam}${used}${desc ? ' — ' + desc : ''}`
 }
 
 // ---------------------------------------------------------------- 工具
@@ -424,8 +524,11 @@ function registerSearch(ctx, config) {
         }
 
         const usage = loadUsage()
+        // 一次算好查询词的稀有度，避免每个技能重复统计
+        const terms = queryTerms(words)
+        const idfMap = new Map(terms.map((tm) => [tm.text, termIdf(tm.text, skills)]))
         const ranked = skills
-          .map((s) => ({ skill: s, score: score(s, words, usage) }))
+          .map((s) => ({ skill: s, score: score(s, terms, idfMap, usage) }))
           .filter((r) => r.score > 0)
           .sort((a, b) => b.score - a.score)
           .slice(0, Math.max(1, Math.min(30, args.limit ?? config.maxResults ?? 8)))
@@ -450,7 +553,7 @@ function registerSearch(ctx, config) {
           }
           deep.sort((a, b) => b.score - a.score)
           // 正文命中天然比元数据弱，阈值跟着降；但只在元数据几乎没命中时才会走到这。
-          if (deep.length && deep[0].score >= 3) {
+          if (deep.length && deep[0].score >= 6) {
             ranked.length = 0
             ranked.push(...deep.slice(0, 8))
             deepHit = true
@@ -466,8 +569,7 @@ function registerSearch(ctx, config) {
 
         // 弱匹配不铺开：最高分不够就别浪费 token 列描述，只报名字让人换词重搜
         const MIN_STRONG = 6
-        // 正文兜底命中本来就分低，别再拿元数据阈值拦它一遍
-        if (!deepHit && ranked[0].score < MIN_STRONG) {
+        if (ranked[0].score < MIN_STRONG) {
           const names = ranked.slice(0, 5).map((r) => r.skill.name).join(', ')
           return [
             prefix,
@@ -602,6 +704,92 @@ function registerRead(ctx, config) {
   )
 }
 
+
+// ---------------------------------------------------------------- 自动提示
+
+// 每个 turn 的第一步入场前，拿用户这句话检索一次；有强命中就塞一行提示。
+// 代价约 50 tokens，目的是消掉「模型没想到去查」这一类失败。
+// 没有强命中就什么都不加——宁可漏，不可吵。
+
+const CONTINUATIONS = /^(继续|接着|再|然后|好|嗯|对|可以|行|ok|go on|continue|yes|嗯嗯)/i
+
+function messageText(messages) {
+  const parts = []
+  for (const m of messages ?? []) {
+    for (const block of m?.content ?? []) {
+      if (block?.type === 'text' && typeof block.text === 'string') parts.push(block.text)
+    }
+  }
+  return parts.join(' ').trim()
+}
+
+function registerAutoHint(ctx, config) {
+  if (config.autoHint === false) return
+
+  // 主机提供的包。装不上就静默关掉这个特性，工具照常可用。
+  let pending
+  const loadCreate = () => {
+    if (!pending) {
+      pending = import('@deepseek-ai/dsh-llm').then(
+        (m) => m.createUserMessage,
+        () => null,
+      )
+    }
+    return pending
+  }
+
+  const hinted = new Map() // sessionId -> Set(skill name)
+
+  ctx.on(
+    'agent/pre-step',
+    async (payload, next) => {
+      const decision = await next()
+      try {
+        if (decision.kind === 'reject' || payload.signal?.aborted || payload.step !== 1) return decision
+
+        const text = messageText(decision.messages)
+        if (text.length < 4 || CONTINUATIONS.test(text)) return decision
+
+        const sessionId = String(payload.agent?.id ?? '')
+        const skills = buildIndex(config, false)
+        if (skills.length === 0) return decision
+
+        const words = text.split(/[\s,，。；;？?！!]+/).filter(Boolean).slice(0, 8)
+        const terms = queryTerms(words)
+        const idfMap = new Map(terms.map((tm) => [tm.text, termIdf(tm.text, skills)]))
+        const best = skills
+          .map((s) => ({ skill: s, score: score(s, terms, idfMap, new Map()) }))
+          .filter((r) => r.score > 0)
+          .sort((a, b) => b.score - a.score)[0]
+
+        const minScore = config.autoHintMinScore ?? 14
+        if (!best || best.score < minScore) return decision
+
+        const seen = hinted.get(sessionId) ?? new Set()
+        if (seen.has(best.skill.name)) return decision
+        seen.add(best.skill.name)
+        hinted.set(sessionId, seen)
+
+        const cost = (best.skill.chars / 1.6 / 1000).toFixed(1)
+        const hint =
+          `[技能库] 可能有用的技能：${best.skill.name}（全文≈${cost}k）。` +
+          `要按它做就 skill_read；不适用就忽略，不必回应这句。`
+
+        const createUserMessage = await loadCreate()
+        if (typeof createUserMessage !== 'function') return decision
+
+        return {
+          kind: 'enter',
+          messages: [...decision.messages, createUserMessage({ content: [{ type: 'text', text: hint }] })],
+        }
+      } catch {
+        // 提示失败绝不能让这一轮失败
+        return decision
+      }
+    },
+    { prepend: true },
+  )
+}
 // ---------------------------------------------------------------- 停用与台账
 
 function registerDrop(ctx) {
@@ -681,4 +869,5 @@ export function apply(ctx, config) {
   registerCatalog(ctx, config)
   registerActive(ctx)
   registerDrop(ctx)
+  registerAutoHint(ctx, config)
 }
