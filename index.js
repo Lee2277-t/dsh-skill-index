@@ -277,7 +277,12 @@ function enrich(skill, text) {
   }
   skill.chars = text.length
   // 正文只留前 8KB：够覆盖开头的方法与工具段，又不至于每个技能常驻 20KB。
-  skill.body = stripFrontmatter(text).toLowerCase().slice(0, 8000)
+  // 注意：不能直接 slice。V8 对大字符串的 slice 返回 SlicedString，
+  // 父串（整份正文）会一直被引用着，"只留 8KB" 是假的——
+  // 实测 3000 个 20KB 文件仍吃 117MB，和没截一样。
+  // 走一趟 Buffer 复制成独立字符串，父串才能被回收。
+  const cut = stripFrontmatter(text).slice(0, 8000)
+  skill.body = Buffer.from(cut, 'utf8').toString('utf8').toLowerCase()
   skill.headings = [...text.matchAll(/^##\s+(.+)$/gm)].map((m) => m[1].trim()).slice(0, 14)
 
   const dir = path.dirname(skill.path)
@@ -517,7 +522,9 @@ function queryTerms(words) {
     const w = raw.toLowerCase()
     if (!w) continue
     // 单个英文字符没有检索意义，但会命中几乎所有描述
-    if (w.length < 2 && !/[\u4e00-\u9fff]/.test(w)) continue
+    // 单字（中英文都算）没有检索意义：
+    // 中文单字会通过分类名和描述命中一大片同类技能，那是"分类浏览"不是检索。
+    if (w.length < 2) continue
     push(w, 1)
     // 中文二元组：让「去水印」能命中「去AI图片水印」
     if (/[\u4e00-\u9fff]/.test(w) && w.length >= 3) {
@@ -665,6 +672,9 @@ function registerSearch(ctx, config) {
           return `No skills indexed. Checked roots: ${roots || '(none configured)'}`
         }
 
+        // limit 传字符串/NaN/负数都不能让它变成 Infinity 或 0
+        const wantedLimit = Number(args.limit ?? config.maxResults ?? 8)
+        const limit = Math.max(1, Math.min(30, Number.isFinite(wantedLimit) ? Math.trunc(wantedLimit) : 8))
         const usage = loadUsage()
         // 一次算好查询词的稀有度，避免每个技能重复统计
         const terms = queryTerms(words)
@@ -673,11 +683,7 @@ function registerSearch(ctx, config) {
           .map((s) => ({ skill: s, score: score(s, terms, idfMap, usage) }))
           .filter((r) => r.score > 0)
           .sort((a, b) => b.score - a.score)
-          .slice(0, (() => {
-          // limit 传字符串/NaN/负数都不能让它变成 Infinity 或 0
-          const wanted = Number(args.limit ?? config.maxResults ?? 8)
-          return Math.max(1, Math.min(30, Number.isFinite(wanted) ? Math.trunc(wanted) : 8))
-        })())
+          .slice(0, limit)
 
         // 头名 38 分、后面跟着 2 分的条目，那不是候选，是噪音——
         // 每条要花 30 多个 token，还稀释判断。低于头名 20% 的直接不显示。
@@ -711,7 +717,10 @@ function registerSearch(ctx, config) {
           deep.sort((a, b) => b.score - a.score)
 
           if (deep.length) {
-            const names = deep.slice(0, 5).map((r) => `${r.skill.name}(${r.score})`).join(', ')
+            const names = deep
+              .slice(0, limit)
+              .map((r) => `${r.skill.name}(${r.score})`)
+              .join(', ')
             return [
               prefix,
               `没有元数据强匹配。正文里出现过这些词：${names}`,
@@ -842,11 +851,15 @@ function registerRead(ctx, config) {
 
         // 先精确，再模糊。模糊命中必须唯一——
         // 以前 find 拿到哪个算哪个，"extract" 会静默返回 pdf-extract 并把记账记到它头上。
-        let hit =
-          skills.find(
-            (s) => s.name.toLowerCase() === key && (!hint || s.folder.toLowerCase() === hint),
-          ) ??
-          skills.find((s) => s.folder.toLowerCase() === key && !hint)
+        const sameName = skills.filter(
+          (s) => s.name.toLowerCase() === key && (!hint || s.folder.toLowerCase() === hint),
+        )
+        // 同名不同目录时不能随便挑一个：那会读错文件，还把记账记到共享的 key 上。
+        if (sameName.length > 1) {
+          const names = sameName.map((s) => `${s.name} @${s.folder}`).join(', ')
+          return `"${wanted}" 匹配到多个技能：${names}。用完整名字，重名时写成 名字 @目录。`
+        }
+        let hit = sameName[0] ?? skills.find((s) => s.folder.toLowerCase() === key && !hint)
 
         if (!hit) {
           // 只挡单字符："x" 能匹配到几乎所有技能。
@@ -920,15 +933,18 @@ const CONTINUATIONS = /^(继续|接着|然后呢?|好的?|嗯+|对|可以|行|ok
 const hintStatus = { state: 'unknown', detail: '' }
 
 // 只在这一轮第一次装配提示词时用一次，避免每步重复占用。
-let pendingHint = null
+// agent.id -> { text, at }。按会话存，避免两个会话互相取走提示。
+const pendingHints = new Map()
 const HINT_TTL = 60_000
 
-function takeHint() {
-  if (!pendingHint) return ''
-  const { text, at } = pendingHint
-  pendingHint = null
-  // 只认刚放进去的那一条。`systemPrompt.context` 拿不到 agent 身份，
-  // 做不到真正按会话隔离；把窗口压到 2 秒，至少不会把几十秒前的提示翻出来给别人用。
+function takeHint(agentId) {
+  const key = agentId ? String(agentId) : 'unknown'
+  const slot = pendingHints.get(key)
+  if (!slot) return ''
+  const { text, at } = slot
+  pendingHints.delete(key)
+  // 只认刚放进去的那一条。提示已经按 agent.id 分桶，这里再压一道时间窗：
+  // 会话被关掉之后残留的那条，不应该过很久才被翻出来。
   if (Date.now() - at > 2000) return ''
   return text
 }
@@ -958,7 +974,10 @@ function registerAutoHint(ctx, config) {
 
   const prompt = ctx.get?.('systemPrompt')
   if (prompt?.context) {
-    prompt.context({ name: 'skill-hint', order: 90, text: () => takeHint() })
+    // provider 会收到 { agent, scope }，所以可以按会话分桶。
+    // 之前写成无参、并且注释断言"拿不到 agent 身份"——那是错的，
+    // 结果两个会话在同一窗口内会互相拿走对方的提示。
+    prompt.context({ name: 'skill-hint', order: 90, text: (c) => takeHint(c?.agent?.id) })
     hintStatus.state = 'ok'
   } else {
     hintStatus.state = 'no-system-prompt'
@@ -1002,7 +1021,7 @@ function registerAutoHint(ctx, config) {
           `[技能库] 可能有用的技能：${best.skill.name}（全文≈${cost}k）。` +
           `要按它做就 skill_read；不适用就忽略，不必回应这句。`
 
-        pendingHint = { text: hint, at: Date.now() }
+        pendingHints.set(sessionId || 'unknown', { text: hint, at: Date.now() })
         hintStatus.state = 'ok'
         return decision
       } catch {
