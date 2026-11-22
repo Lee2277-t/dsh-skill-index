@@ -713,6 +713,21 @@ function registerRead(ctx, config) {
 
 const CONTINUATIONS = /^(继续|接着|再|然后|好|嗯|对|可以|行|ok|go on|continue|yes|嗯嗯)/i
 
+// 自动提示是否真的可用，要能被看见——静默关闭比没有更糟。
+const hintStatus = { state: 'unknown', detail: '' }
+
+// 只在这一轮第一次装配提示词时用一次，避免每步重复占用。
+let pendingHint = null
+const HINT_TTL = 60_000
+
+function takeHint() {
+  if (!pendingHint) return ''
+  const { text, at } = pendingHint
+  pendingHint = null
+  if (Date.now() - at > HINT_TTL) return ''
+  return text
+}
+
 function messageText(messages) {
   const parts = []
   for (const m of messages ?? []) {
@@ -726,19 +741,23 @@ function messageText(messages) {
 function registerAutoHint(ctx, config) {
   if (config.autoHint === false) return
 
-  // 主机提供的包。装不上就静默关掉这个特性，工具照常可用。
-  let pending
-  const loadCreate = () => {
-    if (!pending) {
-      pending = import('@deepseek-ai/dsh-llm').then(
-        (m) => m.createUserMessage,
-        () => null,
-      )
-    }
-    return pending
-  }
+  // 注入消息这条路走不通：
+  //   1. @deepseek-ai/dsh-llm 不暴露给插件，createUserMessage 拿不到；
+  //   2. 自己构造 user 消息会被会话格式拒绝：
+  //      "format v4 message requires a producer-owned source kind"，
+  //      而且失败发生在持久化阶段，会把整个会话的那一轮写坏。
+  // 所以改成不碰会话的通道：pre-step 只往内存放一句话，
+  // 由 systemPrompt.context 在装配提示词时读走。渲染完即清空。
 
   const hinted = new Map() // sessionId -> Set(skill name)
+
+  const prompt = ctx.get?.('systemPrompt')
+  if (prompt?.context) {
+    prompt.context({ name: 'skill-hint', order: 90, text: () => takeHint() })
+    hintStatus.state = 'ok'
+  } else {
+    hintStatus.state = 'no-system-prompt'
+  }
 
   ctx.on(
     'agent/pre-step',
@@ -775,13 +794,9 @@ function registerAutoHint(ctx, config) {
           `[技能库] 可能有用的技能：${best.skill.name}（全文≈${cost}k）。` +
           `要按它做就 skill_read；不适用就忽略，不必回应这句。`
 
-        const createUserMessage = await loadCreate()
-        if (typeof createUserMessage !== 'function') return decision
-
-        return {
-          kind: 'enter',
-          messages: [...decision.messages, createUserMessage({ content: [{ type: 'text', text: hint }] })],
-        }
+        pendingHint = { text: hint, at: Date.now() }
+        hintStatus.state = 'ok'
+        return decision
       } catch {
         // 提示失败绝不能让这一轮失败
         return decision
@@ -829,7 +844,7 @@ function registerDrop(ctx) {
   )
 }
 
-function registerActive(ctx) {
+function registerActive(ctx, config) {
   ctx.tools.register(
     defineTool({
       name: 'skill_active',
@@ -837,9 +852,17 @@ function registerActive(ctx) {
       parameters: {},
       output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
       async execute(_args, exec) {
+        const hintLine =
+          config?.autoHint === false
+            ? '自动提示：已关闭（config.autoHint = false）'
+            : hintStatus.state === 'ok' || hintStatus.state === 'manual'
+              ? '自动提示：开（每轮第一步检索一次，强命中才注入一行）'
+              : hintStatus.state === 'unknown'
+                ? '自动提示：待首次触发时检测'
+                : `自动提示：不可用（@deepseek-ai/dsh-llm ${hintStatus.detail}）`
         const active = activeOf(exec)
         if (active.size === 0) {
-          return '本会话没有加载过技能。当前任务可以直接做，或先 skill_search 看有没有适用的。'
+          return `本会话没有加载过技能。当前任务可以直接做，或先 skill_search 看有没有适用的。\n\n${hintLine}`
         }
         const now = Date.now()
         const rows = [...active.entries()]
@@ -867,7 +890,7 @@ export function apply(ctx, config) {
   registerSearch(ctx, config)
   registerRead(ctx, config)
   registerCatalog(ctx, config)
-  registerActive(ctx)
+  registerActive(ctx, config)
   registerDrop(ctx)
   registerAutoHint(ctx, config)
 }
