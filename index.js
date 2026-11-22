@@ -61,8 +61,10 @@ function parseFrontmatter(text) {
   const lines = text.split(/\r?\n/)
   if (lines[0]?.trim() !== '---') return { name: '', description: '', notFor: '' }
 
+  // 不能按固定行数截断 frontmatter：有的技能头部很长（几十条 metadata），
+  // 一旦截断，name/description 全部退化成空，这个技能在索引里就等于没有。
   let end = -1
-  for (let i = 1; i < Math.min(lines.length, 200); i++) {
+  for (let i = 1; i < lines.length; i++) {
     if (lines[i].trim() === '---') {
       end = i
       break
@@ -82,8 +84,7 @@ function parseFrontmatter(text) {
       i++
       continue
     }
-    // when-not-to-use 是这一版加的约定字段：一行说清什么时候别用。
-    // 没有就当没写，不硬凑。
+    // when-not-to-use 是插件约定的字段：一行说清什么时候别用。
     const notForMatch = /^(?:when-not-to-use|when_not_to_use):\s*(.+)$/.exec(line)
     if (notForMatch) {
       notFor = notForMatch[1].trim().replace(/^["']|["']$/g, '')
@@ -119,20 +120,30 @@ function parseFrontmatter(text) {
 
 // ---------------------------------------------------------------- 索引
 
-let cache = { at: 0, skills: [] }
+let cache = { at: 0, skills: [], key: '' }
 
-function walk(root, depth, out, visited, base) {
+// 正文里带 frontmatter 会让「只写在 description 里的词」被算成正文命中，
+// 标签就变成假的了。所以正文先剥掉头部。
+function stripFrontmatter(text) {
+  const m = /^---\r?\n[\s\S]*?\r?\n---\r?\n?/.exec(text)
+  return m ? text.slice(m[0].length) : text
+}
+
+function walk(root, depth, out, visited, base, viaLink) {
   if (depth > MAX_DEPTH || out.length >= MAX_FILES) return
 
-  // 真实路径去重：junction / symlink 指回祖先时，不加这一步会无限递归直到 OOM。
-  let real
-  try {
-    real = fs.realpathSync(root)
-  } catch {
-    return
+  // 只在根和软链上做 realpath：
+  // 普通目录不可能成环，每个目录都 realpath 一次是纯浪费（真实库上占冷启动的大头）。
+  if (viaLink || depth === 0) {
+    let real
+    try {
+      real = fs.realpathSync(root)
+    } catch {
+      return
+    }
+    if (visited.has(real)) return
+    visited.add(real)
   }
-  if (visited.has(real)) return
-  visited.add(real)
 
   let entries
   try {
@@ -142,14 +153,31 @@ function walk(root, depth, out, visited, base) {
   }
   for (const e of entries) {
     if (out.length >= MAX_FILES) return
-    if (e.name.startsWith('.') || e.name === 'node_modules') continue
-    if (e.isSymbolicLink()) continue
+    // _ 开头的一律当归档/备份，不进索引。
+    // 之前 _备份 里的 172 份副本会被扫进来，只是恰好被同名去重挡住大半——
+    // 备份目录一旦改了名，就会变成一堆重复技能冒出来。
+    if (e.name.startsWith('.') || e.name.startsWith('_') || e.name === 'node_modules') continue
     const full = path.join(root, e.name)
-    if (e.isDirectory()) {
-      walk(full, depth + 1, out, visited, base)
+
+    let isDirEntry = e.isDirectory()
+    let link = false
+    if (e.isSymbolicLink()) {
+      // 用软链组织的技能库很常见（~/.skills/foo -> ~/repos/foo）。
+      // 以前直接 continue，整个库会静默丢失且不给任何提示。
+      try {
+        isDirEntry = fs.statSync(full).isDirectory()
+        link = true
+      } catch {
+        continue
+      }
+    }
+
+    if (isDirEntry) {
+      walk(full, depth + 1, out, visited, base, link)
       continue
     }
     if (e.name !== 'SKILL.md') continue
+
     let text = ''
     try {
       text = fs.readFileSync(full, 'utf8')
@@ -168,38 +196,43 @@ function walk(root, depth, out, visited, base) {
       notFor: fm.notFor,
       path: full,
       dir,
+      _text: text, // 交给 enrich 用，免得同一个文件读两遍
     })
   }
 }
 
 function buildIndex(config, force) {
-  const ttl = (config.refreshSeconds || 300) * 1000
-  if (!force && cache.skills.length > 0 && Date.now() - cache.at < ttl) return cache.skills
-
   const roots = (config.roots?.length ? config.roots : ['~/.skills']).map(expand)
+  // 缓存必须按 roots 分键：同一个进程里插件被重新挂载、或 profile 覆盖挂两份时，
+  // 不区分就会拿上一份根目录的索引，而且不报错。
+  const key = roots.join('|').toLowerCase()
+  const ttl = (config.refreshSeconds || 300) * 1000
+  if (!force && cache.at > 0 && cache.key === key && Date.now() - cache.at < ttl) return cache.skills
+
   const all = []
   for (const root of roots) {
     if (!isDir(root)) continue
     const found = []
-    walk(root, 0, found, new Set(), root)
+    walk(root, 0, found, new Set(), root, false)
     for (const s of found) all.push(s)
   }
 
-  // 同一技能在同一根里出现多次时按 name 去重，保留路径最短的那个
-  const byName = new Map()
+  // 去重键用 name+folder：只按 name 去重会让同名但不同目录的技能静默消失，
+  // 文件还在、工具永远看不见，也没有任何提示。
+  const byKey = new Map()
   for (const s of all) {
-    const key = s.name.toLowerCase()
-    const prev = byName.get(key)
-    if (!prev || s.path.length < prev.path.length) byName.set(key, s)
+    const k = `${s.name.toLowerCase()}|${s.folder.toLowerCase()}`
+    const prev = byKey.get(k)
+    if (!prev || s.path.length < prev.path.length) byKey.set(k, s)
   }
 
-  // 索引时把「判断要不要读」需要的元信息算好：字符数、章节标题、references 清单。
-  // 这些一次算完缓存 5 分钟，之后命中行和 digest 都不额外读文件。
-  const skills = [...byName.values()]
-  for (const s of skills) enrich(s)
+  const skills = [...byKey.values()]
+  for (const s of skills) {
+    enrich(s, s._text)
+    delete s._text
+  }
 
   // 同名前缀的技能成族（seo-*、better-*、sites-*）。
-  // 20 个 seo-* 逐条列出既费 token，又让人分不清它们是一个套件里的兄弟。
   const famCount = new Map()
   for (const s of skills) {
     const fam = s.name.includes('-') ? s.name.split('-')[0] : ''
@@ -210,25 +243,27 @@ function buildIndex(config, force) {
     s.family = fam && (famCount.get(fam) ?? 0) >= 3 ? { name: fam, count: famCount.get(fam) } : null
   }
 
-  cache = { at: Date.now(), skills }
+  cache = { at: Date.now(), skills, key }
   return cache.skills
 }
 
 // ---------------------------------------------------------------- 索引元信息
 
-function enrich(skill) {
-  let text
-  try {
-    text = fs.readFileSync(skill.path, 'utf8')
-  } catch {
-    skill.chars = skill.description.length
-    skill.headings = []
-    skill.refs = []
-    return
+function enrich(skill, text) {
+  if (typeof text !== 'string') {
+    try {
+      text = fs.readFileSync(skill.path, 'utf8')
+    } catch {
+      skill.chars = skill.description.length
+      skill.headings = []
+      skill.refs = []
+      skill.body = ''
+      return
+    }
   }
   skill.chars = text.length
-  // 正文兜底检索用。只留前 20KB，够覆盖开头的方法与工具段。
-  skill.body = text.toLowerCase().slice(0, 20000)
+  // 正文只留前 8KB：够覆盖开头的方法与工具段，又不至于每个技能常驻 20KB。
+  skill.body = stripFrontmatter(text).toLowerCase().slice(0, 8000)
   skill.headings = [...text.matchAll(/^##\s+(.+)$/gm)].map((m) => m[1].trim()).slice(0, 14)
 
   const dir = path.dirname(skill.path)
@@ -299,14 +334,27 @@ function buildDigest(skill, maxChars = 1400) {
 
 const USAGE_PATH = path.join(os.homedir(), '.skill-hub', 'usage.json')
 let usageCache = null
+let usageStamp = -1
+
+// 用 mtime 判失效：删掉文件、或别的进程改过，都要能看见。
+// 之前是纯内存缓存 + 整表覆盖写：删文件不生效，外部写入还会被静默抹掉。
+function usageMtime() {
+  try {
+    return fs.statSync(USAGE_PATH).mtimeMs
+  } catch {
+    return 0
+  }
+}
 
 function loadUsage() {
-  if (usageCache) return usageCache
+  const stamp = usageMtime()
+  if (usageCache && stamp === usageStamp) return usageCache
   try {
     usageCache = new Map(Object.entries(JSON.parse(fs.readFileSync(USAGE_PATH, 'utf8'))))
   } catch {
     usageCache = new Map()
   }
+  usageStamp = stamp
   return usageCache
 }
 
@@ -318,6 +366,7 @@ function recordUsage(name) {
   try {
     fs.mkdirSync(path.dirname(USAGE_PATH), { recursive: true })
     fs.writeFileSync(USAGE_PATH, JSON.stringify(Object.fromEntries(usage), null, 1), 'utf8')
+    usageStamp = usageMtime()
   } catch {
     // 记不上不影响检索，静默放着
   }
@@ -329,6 +378,7 @@ function recordUsage(name) {
 
 // 按会话记「这次读了哪些技能」。key 是 agent.id，拿不到就退化成一个全局桶。
 // 记的是判断依据（token 成本、读的时间），不是内容——内容已经进了上下文，本插件动不了它。
+const MAX_SESSIONS = 200
 const activeBySession = new Map()
 
 function sessionKey(exec) {
@@ -336,9 +386,20 @@ function sessionKey(exec) {
   return id ? String(id) : 'global'
 }
 
+// 会话数无上限时，长跑的宿主会一直涨（每个会话一个 Map）。
+// 超过上限丢最早进入的那个：活跃台账本来只服务当前会话，旧的无所谓。
+function trimSessions(map) {
+  if (map.size <= MAX_SESSIONS) return
+  const oldest = map.keys().next().value
+  map.delete(oldest)
+}
+
 function activeOf(exec) {
   const key = sessionKey(exec)
-  if (!activeBySession.has(key)) activeBySession.set(key, new Map())
+  if (!activeBySession.has(key)) {
+    trimSessions(activeBySession)
+    activeBySession.set(key, new Map())
+  }
   return activeBySession.get(key)
 }
 
@@ -417,6 +478,8 @@ function queryTerms(words) {
   for (const raw of words) {
     const w = raw.toLowerCase()
     if (!w) continue
+    // 单个英文字符没有检索意义，但会命中几乎所有描述
+    if (w.length < 2 && !/[\u4e00-\u9fff]/.test(w)) continue
     push(w, 1)
     // 中文二元组：让「去水印」能命中「去AI图片水印」
     if (/[\u4e00-\u9fff]/.test(w) && w.length >= 3) {
@@ -429,9 +492,11 @@ function queryTerms(words) {
     for (const [zh, ens] of Object.entries(GLOSSARY)) {
       if (w.includes(zh)) for (const en of ens) push(en, 0.7, true)
     }
-    // 反向：英文查询补中文
+    // 反向：英文查询补中文。
+    // 这里必须按词边界精确比，不能用 includes：
+    // silicon 含 icon、latest 含 test、explain 含 plan，都会造出高分假阳性。
     for (const [zh, ens] of Object.entries(GLOSSARY)) {
-      if (ens.some((en) => w === en || w.includes(en))) push(zh, 0.6, true)
+      if (ens.some((en) => w === en || w.split(/[^a-z0-9]+/).includes(en))) push(zh, 0.6, true)
     }
   }
   return terms
@@ -462,8 +527,9 @@ function score(skill, terms, idfMap, usage) {
     // 中文「审查」不该让 review-agent 压过名字里就有「合同」的技能。
     const nameEq = gloss ? 12 : 20
     const nameInc = gloss ? 8 : 10
+    // 单字符只认整串相等：否则 "a" 会给几十个技能各加 10 分
     if (name === w) total += nameEq * weight
-    else if (name.includes(w)) total += nameInc * weight
+    else if (w.length > 1 && name.includes(w)) total += nameInc * weight
     if (folder.includes(w)) total += 6 * weight
     if (cat.includes(w)) total += 4 * weight
     // 描述/标题/「不适合」里的命中按稀有度打折：「清理」这种词不该压过「对账」
@@ -480,12 +546,44 @@ function score(skill, terms, idfMap, usage) {
   return uses > 0 ? Math.round(total * (1 + 0.12 * Math.min(uses, 10))) : total
 }
 
+// 正文兜底的打分：和元数据分开算，因为判据不同。
+// 元数据命中看"名字里有没有"，正文命中只能看"出现了几个词、最长那个多长"——
+// 正文很长，任何词都可能顺带出现一次，所以单个两字词不算数。
+// 正文兜底的打分：和元数据分开算，因为判据不同。
+// 元数据看"名字里有没有"，正文只能看"出现在哪、出现几次"——
+// 一个词在 17k 字的正文里出现一次，几乎不构成证据。
+function scoreBody(skill, terms, idfMap) {
+  const body = skill.body
+  if (!body) return 0
+  let extra = 0
+  let matched = 0
+  let longest = 0
+  let strong = false
+  for (const { text: w, weight } of terms) {
+    const at = body.indexOf(w)
+    if (at < 0) continue
+    const idf = idfMap.get(w) ?? 1.5
+    extra += 3 * weight * Math.min(2.2, Math.max(0.25, idf / 1.6))
+    matched++
+    longest = Math.max(longest, w.length)
+    // 开头 2000 字内出现，或全文出现两次以上，才算"这条技能真在讲这个"
+    if (at < 2000) strong = true
+    else if (body.indexOf(w, at + w.length) >= 0) strong = true
+  }
+  if (matched === 0) return 0
+  if (matched < 2 && !(longest >= 4 && strong)) return 0
+  if (extra < 3) return 0
+  return Math.round(extra)
+}
+
 // 命中行：一行一个。路径不给——读技能要走 skill_read，那样才会记账。
 // 省下来的正是每行 70 多个字符的路径。
-function formatHit(s, score, uses, tokens) {
+function formatHit(s, score, uses, chars) {
   const desc = s.description.length > 90 ? s.description.slice(0, 87) + '…' : s.description
   const used = uses > 0 ? ` ·用过${uses}次` : ''
-  const cost = tokens ? ` ·全文≈${(tokens / 1000).toFixed(1)}k` : ''
+  // chars 是字符数，不是 token。这里必须换算，否则同一个技能在检索里显示 17.2k、
+  // 在 digest 里显示 10.7k，两个数差了 1.6 倍，省 token 的账就没法算。
+  const cost = chars ? ` ·全文≈${(chars / 1.6 / 1000).toFixed(1)}k` : ''
   const fam = s.family ? ` ·族:${s.family.name}(${s.family.count})` : ''
   return `- ${s.name} [${s.category}] ${score}${cost}${fam}${used}${desc ? ' — ' + desc : ''}`
 }
@@ -536,38 +634,38 @@ function registerSearch(ctx, config) {
         const ledger = activeLine(exec)
         const prefix = ledger ? `[技能台账] ${ledger}` : null
 
-        // 元数据命中不够时，再翻正文。woff2、pyftsubset 这类词通常只写在正文里。
-        // 权重压得很低，所以不会盖过名字/描述层面的命中。
-        let deepHit = false
-        if (ranked.length === 0 || ranked[0].score < 6) {
-          const terms = queryTerms(words)
+        // 元数据完全没命中时，再翻正文。
+        //
+        // 两件事必须同时成立，否则正文匹配就是纯噪音：
+        //   1. 一个词在多长的正文里出现过，几乎不构成证据；
+        //   2. 出现在正文开头（技能通常先说清自己是干什么的），或者反复出现。
+        //
+        // 即使命中，也不把它当成"强匹配"返回——只报名字，让人自己判断。
+        // 之前这里会把正文命中混进 ranked，结果一个词就顶掉了正常排序。
+        if (ranked.length === 0) {
           const deep = []
           for (const s of skills) {
-            if (!s.body) continue
-            const base = ranked.find((r) => r.skill === s)?.score ?? 0
-            let extra = 0
-            for (const { text: w, weight } of terms) {
-              if (s.body.includes(w)) extra += 3 * weight
-            }
-            if (extra > 0) deep.push({ skill: s, score: Math.round(base + extra) })
+            const sc = scoreBody(s, terms, idfMap)
+            if (sc > 0) deep.push({ skill: s, score: sc })
           }
           deep.sort((a, b) => b.score - a.score)
-          // 正文命中天然比元数据弱，阈值跟着降；但只在元数据几乎没命中时才会走到这。
-          if (deep.length && deep[0].score >= 6) {
-            ranked.length = 0
-            ranked.push(...deep.slice(0, 8))
-            deepHit = true
-          }
-        }
 
-        if (ranked.length === 0) {
+          if (deep.length) {
+            const names = deep.slice(0, 5).map((r) => `${r.skill.name}(${r.score})`).join(', ')
+            return [
+              prefix,
+              `没有元数据强匹配。正文里出现过这些词：${names}`,
+              '只是线索，不算命中——用 skill_read 看一眼 digest 再决定，别直接照做。',
+            ]
+              .filter((x) => x !== null)
+              .join('\n')
+          }
+
           return (
             `No skill matched "${words.join(' ')}" among ${skills.length} indexed skills.\n` +
             'Try fewer or different keywords, or call skill_catalog to see the categories.'
           )
         }
-
-        // 弱匹配不铺开：最高分不够就别浪费 token 列描述，只报名字让人换词重搜
         const MIN_STRONG = 6
         if (ranked[0].score < MIN_STRONG) {
           const names = ranked.slice(0, 5).map((r) => r.skill.name).join(', ')
@@ -580,7 +678,8 @@ function registerSearch(ctx, config) {
             .join('\n')
         }
 
-        const header = `Matched ${ranked.length} of ${skills.length} indexed skills for "${words.join(' ')}"${deepHit ? '（按正文命中）' : ''}:`
+        const shown = words.join(' ').slice(0, 60)
+        const header = `Matched ${ranked.length} of ${skills.length} indexed skills for "${shown}${words.join(' ').length > 60 ? '…' : ''}":`
         const body = ranked.map((r) =>
           formatHit(r.skill, r.score, usage.get(r.skill.name.toLowerCase())?.count ?? 0, r.skill.chars),
         )
@@ -624,7 +723,9 @@ function registerCatalog(ctx, config) {
         }
         if (groups.size === 0) return `No category matched "${args.category}".`
 
-        const out = [`${skills.length} skills in ${groups.size} categories:`]
+        // 过滤之后还写全库总数，会让人以为这个分类有 172 个技能。
+    const listed = [...groups.values()].reduce((n, arr) => n + arr.length, 0)
+    const out = [`${listed} skills in ${groups.size} categories:`]
         for (const cat of [...groups.keys()].sort()) {
           const items = groups.get(cat).sort((a, b) => a.name.localeCompare(b.name))
           out.push('', `## ${cat} (${items.length})`)
@@ -665,11 +766,22 @@ function registerRead(ctx, config) {
         }
 
         const key = wanted.toLowerCase()
-        const hit =
+        // 先精确，再模糊。模糊命中必须唯一——
+        // 以前 find 拿到哪个算哪个，"extract" 会静默返回 pdf-extract 并把记账记到它头上。
+        const exact =
           skills.find((s) => s.name.toLowerCase() === key) ??
-          skills.find((s) => s.folder.toLowerCase() === key) ??
-          skills.find((s) => s.name.toLowerCase().includes(key)) ??
-          skills.find((s) => s.folder.toLowerCase().includes(key))
+          skills.find((s) => s.folder.toLowerCase() === key)
+        let hit = exact
+        if (!hit) {
+          const partial = skills.filter(
+            (s) => s.name.toLowerCase().includes(key) || s.folder.toLowerCase().includes(key),
+          )
+          if (partial.length > 1) {
+            const names = partial.slice(0, 8).map((s) => s.name).join(', ')
+            return `"\${wanted}" 匹配到多个技能：\${names}。请用完整名字。`
+          }
+          hit = partial[0]
+        }
         if (!hit) {
           return (
             `No skill named "${wanted}" among ${skills.length} indexed skills.\n` +
@@ -711,7 +823,9 @@ function registerRead(ctx, config) {
 // 代价约 50 tokens，目的是消掉「模型没想到去查」这一类失败。
 // 没有强命中就什么都不加——宁可漏，不可吵。
 
-const CONTINUATIONS = /^(继续|接着|再|然后|好|嗯|对|可以|行|ok|go on|continue|yes|嗯嗯)/i
+// 只有整句就是一个接续词才跳过。
+// 以前是按首字判断，"再查一下字体裁剪""可以帮我做个 PPT"全被当成"继续"吞掉了。
+const CONTINUATIONS = /^(继续|接着|然后呢?|好的?|嗯+|对|可以|行|ok|okay|go on|continue|yes|谢谢|多谢)[。.!！?？]*$/i
 
 // 自动提示是否真的可用，要能被看见——静默关闭比没有更糟。
 const hintStatus = { state: 'unknown', detail: '' }
@@ -724,7 +838,9 @@ function takeHint() {
   if (!pendingHint) return ''
   const { text, at } = pendingHint
   pendingHint = null
-  if (Date.now() - at > HINT_TTL) return ''
+  // 只认刚放进去的那一条。`systemPrompt.context` 拿不到 agent 身份，
+  // 做不到真正按会话隔离；把窗口压到 2 秒，至少不会把几十秒前的提示翻出来给别人用。
+  if (Date.now() - at > 2000) return ''
   return text
 }
 
@@ -757,6 +873,7 @@ function registerAutoHint(ctx, config) {
     hintStatus.state = 'ok'
   } else {
     hintStatus.state = 'no-system-prompt'
+    hintStatus.detail = '主机没有暴露 systemPrompt 服务'
   }
 
   ctx.on(
@@ -767,7 +884,9 @@ function registerAutoHint(ctx, config) {
         if (decision.kind === 'reject' || payload.signal?.aborted || payload.step !== 1) return decision
 
         const text = messageText(decision.messages)
-        if (text.length < 4 || CONTINUATIONS.test(text)) return decision
+        // 下界不能是 4：中文最常用的就是 2-3 字（字体、水印、排版、小程序），
+        // 卡在 4 等于把最常见的问法全排除了。
+        if (text.trim().length < 2 || CONTINUATIONS.test(text.trim())) return decision
 
         const sessionId = String(payload.agent?.id ?? '')
         const skills = buildIndex(config, false)
@@ -859,7 +978,7 @@ function registerActive(ctx, config) {
               ? '自动提示：开（每轮第一步检索一次，强命中才注入一行）'
               : hintStatus.state === 'unknown'
                 ? '自动提示：待首次触发时检测'
-                : `自动提示：不可用（@deepseek-ai/dsh-llm ${hintStatus.detail}）`
+                : `自动提示：不可用（${hintStatus.detail || hintStatus.state}）`
         const active = activeOf(exec)
         if (active.size === 0) {
           return `本会话没有加载过技能。当前任务可以直接做，或先 skill_search 看有没有适用的。\n\n${hintLine}`
