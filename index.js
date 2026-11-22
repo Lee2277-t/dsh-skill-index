@@ -1093,18 +1093,28 @@ function registerAutoHint(ctx, config) {
         // 粘贴的内容不是任务请求。
         // 实测：贴一段代码会提示 music-mv，贴一份 markdown 报告会提示
         // stock-research-report-expert——它们只是"出现过这些词"，不是要做这件事。
-        const pasteLike = /\`\`\`/.test(text) || /\n#{1,3}\s/.test(text) || /\n\|\s*-{3,}/.test(text)
-        if (pasteLike && text.length > 400) return decision
-        // 请求词必须中英都认：只匹配中文祈使词时，
-        // 一段 300 字符的英文需求会被当成"不是请求"直接吞掉（实测确实发生了）。
-        const requestLike =
-          /(帮我|帮忙|请|麻烦|需要|想要|怎么|如何|能不能|可不可以|做一个|写一个|生成|检查|审查|优化|修复|改成|整理|分析|看下|看看)/.test(
-            text,
+        // 判据分层，因为两类输入的差别不在长度，在"有没有人让我做事"。
+        //
+        // 英文只认情态框架，不认裸动词：
+        // 终端日志里全是 npm run build / fix grid / eslint，
+        // 认裸动词会把 500 字日志当成请求（实测误报过一次）。
+        const hasRequest = (s) =>
+          // 只认"明确指使"的词。
+          // 需要/想要/分析/检查 这些在陈述句里到处都是——
+          // 「需要增加超时重试」不是让我做事，会议纪要因此被误判成请求。
+          /(帮我|帮忙|麻烦你|麻烦帮|请你|您帮|能不能|可不可以|如何|怎么|做一个|写一个|生成一?个|改一下|看一下|看看这个|评估一下|排查一下)/.test(
+            s,
           ) ||
-          /\b(help|please|could you|can you|would you|how (do|to|can|should)|write|create|make|build|fix|check|review|optimi[sz]e|generate|refactor|analy[sz]e|set ?up|clean ?up|look at)\b/i.test(
-            text,
-          )
-        if (!requestLike && text.length > 200) return decision
+          /\b(can you|could you|would you|please|help me|i (need|want|would like)|how (do|to|can|should) i)\b/i.test(s)
+
+        const fence = text.search(/\`\`\`/)
+        const head = fence < 0 ? text : text.slice(0, fence)
+        const pasteLike = fence >= 0 || /\n#{1,3}\s/.test(text) || /\n\|\s*-{3,}/.test(text)
+
+        // 「帮我检查这段代码 + 500 字代码」是最常见的真实请求，
+        // 不能因为带代码块就整条吞掉——只看第一个代码块之前有没有请求词。
+        if (pasteLike && text.length > 400 && !hasRequest(head)) return decision
+        if (!hasRequest(text) && text.length > 200) return decision
 
         // 下界不能是 4：中文最常用的就是 2-3 字（字体、水印、排版、小程序），
         // 卡在 4 等于把最常见的问法全排除了。
