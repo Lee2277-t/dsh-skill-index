@@ -58,7 +58,7 @@ function expand(p) {
 // 三个工具各自的 "No skills indexed" 文案也要用它——
 // 以前那里直接 (config.roots ?? []).map，roots 传字符串就抛。
 // 被丢掉的根不能静默：用户会以为根生效了，只是库是空的。
-let rootStats = { configured: 0, used: 0, skipped: 0 }
+let rootStats = { configured: 0, used: 0, skipped: 0, linksSkipped: 0 }
 
 function rootsOf(config) {
   const raw = Array.isArray(config?.roots)
@@ -191,7 +191,10 @@ function walk(root, depth, out, visited, base, viaLink, followLinks) {
     if (e.isSymbolicLink()) {
       // 用软链组织的技能库很常见（~/.skills/foo -> ~/repos/foo）。
       // 但跟随也意味着"库里的链接可以指到任何地方"，所以留一个开关能关掉。
-      if (!followLinks) continue
+      if (!followLinks) {
+        rootStats.linksSkipped++
+        continue
+      }
       try {
         isDirEntry = fs.statSync(full).isDirectory()
         link = true
@@ -410,45 +413,54 @@ function loadUsage() {
   return usageCache
 }
 
-function recordUsage(name) {
-  const key = name.toLowerCase()
+let usageDropped = 0
 
-  // 这里必须串行化整个「读-改-写」。
-  //
-  // 实测（6 进程各 40 次读，目标文件共用）：
-  //   - 不加锁：期望 240 次，实际只剩 41 次
-  //   - Windows 上 rename 覆盖"正被并发读"的文件会返回 EPERM，概率约 60%，
-  //     原来那个 catch{} 把这些写入直接吞了，连临时文件都留在硬盘上
-  // 影响面只是排序权重，不影响检索内容，但"看起来是准的"比"不准"更糟。
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// 记账必须是异步的。
+//
+// 上一版用同步忙等抢锁，实测最坏情况把整个宿主进程卡住 1.5 秒
+// （期间 20ms 定时器跑了 0 次，别的会话和 UI 全不响应）。
+// 丢一次排序权重的代价，远小于卡住整个进程——所以这里全部走 await，
+// 抢锁预算也压到 300ms：抢不到就放弃，不能为了记一笔账拖慢别人。
+async function recordUsage(name) {
+  const key = name.toLowerCase()
   const lock = `${USAGE_PATH}.lock`
+
   try {
-    fs.mkdirSync(path.dirname(USAGE_PATH), { recursive: true })
+    await fs.promises.mkdir(path.dirname(USAGE_PATH), { recursive: true })
   } catch {
+    usageDropped++
     return
   }
 
   let fd = null
-  const deadline = Date.now() + 1500
+  // 异步等待不阻塞事件循环，所以预算可以放得比同步版宽：
+  // 代价只是这一通调用慢一点，而不是把整个宿主卡住。
+  const deadline = Date.now() + 800
   while (Date.now() < deadline) {
     try {
-      fd = fs.openSync(lock, 'wx')
+      fd = await fs.promises.open(lock, 'wx')
       break
     } catch (e) {
-      if (e.code !== 'EEXIST') return
-      // 锁文件超过 5 秒视为上一个进程死掉了，清掉重来
+      if (e.code !== 'EEXIST') {
+        usageDropped++
+        return
+      }
+      // 锁文件超过 5 秒视为上一个进程死了，清掉重来
       try {
-        if (Date.now() - fs.statSync(lock).mtimeMs > 5000) fs.unlinkSync(lock)
+        const st = await fs.promises.stat(lock)
+        if (Date.now() - st.mtimeMs > 5000) await fs.promises.unlink(lock)
       } catch {
         /* 别人刚删掉，正常 */
       }
-      // 退避：同步等待几毫秒，比丢掉一次计数便宜
-      const until = Date.now() + 2 + Math.random() * 6
-      while (Date.now() < until) {
-        /* spin */
-      }
+      await sleep(2 + Math.random() * 6)
     }
   }
-  if (fd === null) return // 抢不到锁就放弃这次记账，不能拖慢检索
+  if (fd === null) {
+    usageDropped++
+    return
+  }
 
   try {
     const usage = readUsageFile()
@@ -456,40 +468,40 @@ function recordUsage(name) {
     const count = (Number.isFinite(prev.count) ? prev.count : 0) + 1
     usage.set(key, { count, last: new Date().toISOString() })
     usageCache = usage
+
     const tmp = `${USAGE_PATH}.${process.pid}.tmp`
-    fs.writeFileSync(tmp, JSON.stringify(Object.fromEntries(usage), null, 1), 'utf8')
-    // rename 遇 EPERM/EBUSY 要退避重试，不能吞
+    await fs.promises.writeFile(tmp, JSON.stringify(Object.fromEntries(usage), null, 1), 'utf8')
+
+    // rename 遇 EPERM/EBUSY 要退避重试，不能吞（Windows 上覆盖"正被并发读"的文件会失败）
     let moved = false
     for (let i = 0; i < 6 && !moved; i++) {
       try {
-        fs.renameSync(tmp, USAGE_PATH)
+        await fs.promises.rename(tmp, USAGE_PATH)
         moved = true
       } catch (e) {
         if (e.code !== 'EPERM' && e.code !== 'EBUSY' && e.code !== 'EACCES') break
-        const until = Date.now() + 5 + i * 15
-        while (Date.now() < until) {
-          /* spin */
-        }
+        await sleep(5 + i * 15)
       }
     }
     if (!moved) {
+      usageDropped++
       try {
-        fs.unlinkSync(tmp)
+        await fs.promises.unlink(tmp)
       } catch {
         /* 清不掉就算了 */
       }
     }
     usageStamp = usageMtime()
   } catch {
-    // 记不上不影响检索
+    usageDropped++
   } finally {
     try {
-      fs.closeSync(fd)
+      await fd.close()
     } catch {
       /* ignore */
     }
     try {
-      fs.unlinkSync(lock)
+      await fs.promises.unlink(lock)
     } catch {
       /* ignore */
     }
@@ -750,7 +762,11 @@ function registerSearch(ctx, config) {
         const skills = buildIndex(config, false)
         if (skills.length === 0) {
           const roots = rootsOf(config).join(', ')
-          return `No skills indexed. Checked roots: ${roots || '(none configured)'}`
+          const linkNote =
+            rootStats.linksSkipped > 0
+              ? ` 检测到 ${rootStats.linksSkipped} 个软链目录已跳过（followLinks: false）。`
+              : ''
+          return `No skills indexed. Checked roots: ${roots || '(none configured)'}${linkNote}`
         }
 
         // limit 传字符串/NaN/负数都不能让它变成 Infinity 或 0
@@ -978,7 +994,7 @@ function registerRead(ctx, config) {
         } catch (e) {
           return `ERROR: cannot read ${hit.path}: ${e.message}`
         }
-        recordUsage(hit.name)
+        await recordUsage(hit.name)
         const mode = String(args.mode ?? 'digest').trim().toLowerCase()
 
         if (mode !== 'full') {
@@ -1169,8 +1185,21 @@ function registerActive(ctx, config) {
                 ? '自动提示：待首次触发时检测'
                 : `自动提示：不可用（${hintStatus.detail || hintStatus.state}）`
         const active = activeOf(exec)
+        // 这两条以前只写在"有技能"的分支里，空会话看不到——
+        // 而刚开局看 skill_active 时，恰恰最需要知道"我的根配置生效了吗"。
+        // 不建索引也要先解析一次根，否则空会话时分不清"没配根"和"根无效"
+        rootsOf(config)
+        const notices = []
+        if (rootStats.skipped > 0) {
+          notices.push(`注意：${rootStats.configured} 个配置根里有 ${rootStats.skipped} 个无效（非字符串或空），已跳过。`)
+        }
+        if (usageDropped > 0) {
+          notices.push(`记账有 ${usageDropped} 次因并发冲突放弃，排序权重可能略偏。`)
+        }
         if (active.size === 0) {
-          return `本会话没有加载过技能。当前任务可以直接做，或先 skill_search 看有没有适用的。\n\n${hintLine}`
+          return [`本会话没有加载过技能。当前任务可以直接做，或先 skill_search 看有没有适用的。`, ...notices, '', hintLine]
+            .filter((x) => x !== null)
+            .join('\n')
         }
         const now = Date.now()
         const rows = [...active.entries()]
@@ -1189,9 +1218,7 @@ function registerActive(ctx, config) {
           '如果当前任务和其中某些无关，用 skill_drop 停用它们——停用会改变后续行为，但不减少上下文，',
           '真正释放要等压缩。技能里最贵的不是搜索，是「加载了却用不上还一直占着」。',
           '',
-          rootStats.skipped > 0
-            ? `注意：${rootStats.configured} 个配置根里有 ${rootStats.skipped} 个无效（非字符串或空），已跳过。`
-            : null,
+          ...notices,
           hintLine,
         ].filter((x) => x !== null).join('\n')
       },
