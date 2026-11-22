@@ -514,6 +514,9 @@ function termIdf(term, skills) {
   return Math.log(1 + skills.length / (1 + df))
 }
 
+// 自述是"合集/入口/枢纽"的技能，多半是把人引到别的技能去，自己不做这件事。
+const HUB_RE = /(合集|总入口|入口|编排|分发|路由|hub|dispatcher|collection of|entry point|router)/i
+
 function score(skill, terms, idfMap, usage) {
   const name = skill.name.toLowerCase()
   const folder = skill.folder.toLowerCase()
@@ -541,6 +544,9 @@ function score(skill, terms, idfMap, usage) {
   }
   total = Math.round(total)
   if (total === 0) return 0
+  // 入口型技能降权：合集/枢纽的 description 往往直接写着任务词（"整站审计"），
+  // 名字匹配又最重，于是它排到真正干活的技能前面。
+  if (HUB_RE.test(desc)) total = Math.round(total * 0.85)
   // 读过的技能排前面：最多 +120%，十次封顶
   const uses = usage?.get(skill.name.toLowerCase())?.count ?? 0
   return uses > 0 ? Math.round(total * (1 + 0.12 * Math.min(uses, 10))) : total
@@ -630,6 +636,16 @@ function registerSearch(ctx, config) {
           .filter((r) => r.score > 0)
           .sort((a, b) => b.score - a.score)
           .slice(0, Math.max(1, Math.min(30, args.limit ?? config.maxResults ?? 8)))
+
+        // 头名 38 分、后面跟着 2 分的条目，那不是候选，是噪音——
+        // 每条要花 30 多个 token，还稀释判断。低于头名 20% 的直接不显示。
+        if (ranked.length > 1) {
+          const top = ranked[0]
+          const floor = Math.max(6, top.score * 0.2)
+          const kept = ranked.filter((r) => r.score >= floor)
+          ranked.length = 0
+          ranked.push(...(kept.length ? kept : [top]))
+        }
 
         const ledger = activeLine(exec)
         const prefix = ledger ? `[技能台账] ${ledger}` : null
