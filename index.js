@@ -183,8 +183,88 @@ function buildIndex(config, force) {
     if (!prev || s.path.length < prev.path.length) byName.set(key, s)
   }
 
-  cache = { at: Date.now(), skills: [...byName.values()] }
+  // 索引时把「判断要不要读」需要的元信息算好：字符数、章节标题、references 清单。
+  // 这些一次算完缓存 5 分钟，之后命中行和 digest 都不额外读文件。
+  const skills = [...byName.values()]
+  for (const s of skills) enrich(s)
+
+  cache = { at: Date.now(), skills }
   return cache.skills
+}
+
+// ---------------------------------------------------------------- 索引元信息
+
+function enrich(skill) {
+  let text
+  try {
+    text = fs.readFileSync(skill.path, 'utf8')
+  } catch {
+    skill.chars = skill.description.length
+    skill.headings = []
+    skill.refs = []
+    return
+  }
+  skill.chars = text.length
+  skill.headings = [...text.matchAll(/^##\s+(.+)$/gm)].map((m) => m[1].trim()).slice(0, 14)
+
+  const dir = path.dirname(skill.path)
+  const refs = []
+  for (const sub of ['references', 'scripts', 'assets']) {
+    const full = path.join(dir, sub)
+    if (!fs.existsSync(full)) continue
+    let entries
+    try {
+      entries = fs.readdirSync(full, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const e of entries.slice(0, 12)) {
+      if (!e.isFile()) continue
+      try {
+        const st = fs.statSync(path.join(full, e.name))
+        refs.push({ path: `${sub}/${e.name}`, chars: st.size })
+      } catch {
+        /* 读不到就跳过 */
+      }
+    }
+  }
+  skill.refs = refs
+}
+
+// digest：只够判断"要不要用它"，不够照着做。
+// 中位 310 tokens，全文 3,853 —— 判断阶段贵 12 倍没有道理。
+function buildDigest(skill, maxChars = 1400) {
+  const lines = []
+  lines.push(`# ${skill.name}  [${skill.category}]`)
+  lines.push(`全文 ≈${(skill.chars / 1.6 / 1000).toFixed(1)}k tokens · ${skill.path}`)
+  if (skill.description) {
+    lines.push('')
+    lines.push(skill.description.length > 300 ? skill.description.slice(0, 297) + '…' : skill.description)
+  }
+  // 描述很少写清「什么时候不该用」，但判断阶段这条信息最值钱。
+  // 只有少数技能有这一节，有就带上，没有就不硬凑。
+  if (skill.text) {
+    const notFor = skill.text.match(/^#{1,3}[^\n]*(?:不该用|不适用|什么时候不用|何时不用)[^\n]*\n([\s\S]{0,320})/m)
+    if (notFor) {
+      lines.push('')
+      lines.push('## 什么时候不该用（原文）')
+      lines.push(notFor[1].trim().slice(0, 300))
+    }
+  }
+  if (skill.headings.length) {
+    lines.push('')
+    lines.push('## 结构')
+    lines.push(skill.headings.map((h) => `- ${h}`).join('\n'))
+  }
+  if (skill.refs.length) {
+    lines.push('')
+    lines.push('## 附带文件（按需读，不用整份载入）')
+    for (const r of skill.refs) lines.push(`- ${r.path}  ${(r.chars / 1024).toFixed(1)}KB`)
+  }
+  lines.push('')
+  lines.push(`要照它做，调 skill_read({ name: "${skill.name}", mode: "full" }) 读全文。`)
+  const out = lines.join('\n')
+  return out.length > maxChars ? out.slice(0, maxChars) + '\n…（digest 已截断）' : out
 }
 
 // ---------------------------------------------------------------- 使用账本
@@ -266,14 +346,13 @@ function score(skill, words, usage) {
   return uses > 0 ? Math.round(total * (1 + 0.12 * Math.min(uses, 10))) : total
 }
 
-function formatHit(s, score, uses) {
-  const desc = s.description.length > 160 ? s.description.slice(0, 157) + '…' : s.description
-  const used = uses > 0 ? `  用过 ${uses} 次` : ''
-  return [
-    `- ${s.name}  [${s.category}]  score=${score}${used}`,
-    desc ? `  ${desc}` : '  (no description)',
-    `  ${s.path}`,
-  ].join('\n')
+// 命中行：一行一个。路径不给——读技能要走 skill_read，那样才会记账。
+// 省下来的正是每行 70 多个字符的路径。
+function formatHit(s, score, uses, tokens) {
+  const desc = s.description.length > 90 ? s.description.slice(0, 87) + '…' : s.description
+  const used = uses > 0 ? ` ·用过${uses}次` : ''
+  const cost = tokens ? ` ·全文≈${(tokens / 1000).toFixed(1)}k` : ''
+  return `- ${s.name} [${s.category}] ${score}${cost}${used}${desc ? ' — ' + desc : ''}`
 }
 
 // ---------------------------------------------------------------- 工具
@@ -328,10 +407,27 @@ function registerSearch(ctx, config) {
           )
         }
 
-        const header = `Matched ${ranked.length} of ${skills.length} indexed skills for "${words.join(' ')}":`
         const ledger = activeLine(exec)
-        const body = ranked.map((r) => formatHit(r.skill, r.score, usage.get(r.skill.name.toLowerCase())?.count ?? 0))
-        return [ledger ? `[技能台账] ${ledger}` : null, header, '', ...body].filter((x) => x !== null).join('\n')
+        const prefix = ledger ? `[技能台账] ${ledger}` : null
+
+        // 弱匹配不铺开：最高分不够就别浪费 token 列描述，只报名字让人换词重搜
+        const MIN_STRONG = 6
+        if (ranked[0].score < MIN_STRONG) {
+          const names = ranked.slice(0, 5).map((r) => r.skill.name).join(', ')
+          return [
+            prefix,
+            `没有强匹配（最高 ${ranked[0].score} 分，阈值 ${MIN_STRONG}）。可能相关：${names}`,
+            '这些不太可能适用——直接做，或换个说法再搜。硬读一个弱匹配的技能，比不读更贵。',
+          ]
+            .filter((x) => x !== null)
+            .join('\n')
+        }
+
+        const header = `Matched ${ranked.length} of ${skills.length} indexed skills for "${words.join(' ')}":`
+        const body = ranked.map((r) =>
+          formatHit(r.skill, r.score, usage.get(r.skill.name.toLowerCase())?.count ?? 0, r.skill.chars),
+        )
+        return [prefix, header, '', ...body].filter((x) => x !== null).join('\n')
       },
     }),
   )
@@ -402,6 +498,13 @@ function registerRead(ctx, config) {
           required: true,
           description: 'Skill name or its folder name, case insensitive.',
         },
+        mode: {
+          type: 'string',
+          description:
+            'digest (default, ~300 tokens: description, section headings, bundled files) or full ' +
+            '(the whole SKILL.md, a median ~3,850 tokens). Use digest to decide whether the skill ' +
+            'applies; switch to full only when you are going to follow it.',
+        },
       },
       output: {
         schema: { type: 'string' },
@@ -437,8 +540,15 @@ function registerRead(ctx, config) {
           return `ERROR: cannot read ${hit.path}: ${e.message}`
         }
         recordUsage(hit.name)
-        activeOf(exec).set(hit.name, { tokens: estimateTokens(text), at: Date.now(), category: hit.category })
+        const mode = String(args.mode ?? 'digest').toLowerCase()
 
+        if (mode !== 'full') {
+          const digest = buildDigest({ ...hit, chars: text.length, text })
+          activeOf(exec).set(hit.name, { tokens: estimateTokens(digest), at: Date.now(), category: hit.category, mode: 'digest' })
+          return digest
+        }
+
+        activeOf(exec).set(hit.name, { tokens: estimateTokens(text), at: Date.now(), category: hit.category, mode: 'full' })
         const MAX = 40000
         const body =
           text.length > MAX

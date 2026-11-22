@@ -31,6 +31,30 @@ Matched 5 of 171 indexed skills for "PPT 排版":
 
 ### `skill_read`
 
+按名字读某个技能的 `SKILL.md`，并且**记一次使用**。默认只给 digest：
+
+```
+skill_read({ name: "wechat-miniprogram-privacy-audit" })
+
+# wechat-miniprogram-privacy-audit  [02-微信小程序]
+全文 ≈0.6k tokens · C:\...\小程序隐私合规审计\SKILL.md
+
+扫描微信小程序可能涉及隐私的接口、组件、声明与失败处理，形成带代码位置的待核对清单。...
+
+## 结构
+- 范围与依据
+- 工作流程
+- 失败处理与完成标准
+
+## 附带文件（按需读，不用整份载入）
+- scripts/privacy_audit.py  13.4KB
+
+要照它做，调 skill_read({ name: "...", mode: "full" }) 读全文。
+```
+
+要照着做时再加 `mode: "full"`。
+
+
 按名字读某个技能的 `SKILL.md` 正文，并且**记一次使用**。
 
 ```
@@ -85,6 +109,40 @@ skill_drop({ name: "ai-mv-production", reason: "换成排版任务" })
 skill_catalog({ category: "translation" })
 ```
 
+## 省了多少
+
+对一个 172 个技能的库实测（`skill_search` 每次 5 条命中，`skill_read` 取 4 个样本）：
+
+| 动作 | 改前 | 改后 | 省 |
+|---|---|---|---|
+| 检索输出（8 个查询合计） | 3,358 tokens | 2,416 tokens | **28%** |
+| 单次检索（命中 5 条时） | ≈760 tokens | ≈455 tokens | **40%** |
+| 判断要不要用一个技能 | 6,834 tokens（全文） | 1,452 tokens（digest） | **79%** |
+
+省下来的地方很具体：
+
+1. **不再输出路径。** 命中行从 3 行变 1 行，每行少 70 多个字符的路径。读技能要走 `skill_read`，那样才会记账——顺带把记账变成唯一入口。
+2. **digest 代替全文。** 判断"这个技能适用吗"只需要描述 + 章节标题 + 附带文件清单，中位 310 tokens；照它做才需要 3,853 tokens 的全文。
+3. **弱匹配不铺开。** 最高分不到阈值时只报名字，不列描述。硬读一个弱相关的技能，比不读更贵。
+
+## 设计依据
+
+这三步不是拍脑袋，是照着 **progressive disclosure** 的标准模型做的：
+
+- 官方定义的三层：**Discovery**（启动时只载入 name 与 description）→ **Activation**（匹配后读完整 `SKILL.md`）→ **Execution**（按需执行附带脚本、读取 `references/`）。
+- 参考：[Anthropic 工程博客](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills) 与
+  [Agent Skills 开放标准](https://agentskills.io/)（2025-12 公开）。
+
+对照之后发现原版有三个不符合的地方，这一版补齐了：
+
+| 环节 | 标准 | 原版 | 现在 |
+|---|---|---|---|
+| Discovery | 元数据要轻 | 每次 3 行带路径 | 一行 + 成本标注 |
+| Activation | 匹配后载入 | 只能全量载入 | digest → full 两级 |
+| Execution | 按需读附带文件 | 完全没提及 | digest 里列出 `references/` 与 `scripts/` |
+
+标准里有一句话值得抄下来：**"Full instructions load only when a task calls for them, so agents can keep many skills on hand with only a small context footprint."**
+172 个技能塞不进系统提示（那是每轮 2.6 万 tokens），但可以"放在手边"——这就是检索 + 两级加载的意义。
 ## 安装
 
 ```
