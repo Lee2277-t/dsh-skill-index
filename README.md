@@ -239,6 +239,7 @@ aliases:
 | `refreshSeconds` | 300 | 索引缓存时长 |
 | `autoHint` | true | 关掉自动提示 |
 | `autoHintMinScore` | 14 | 自动提示的分数门槛 |
+| `aliases` | {} | 按技能名补口语别名，解决「作者这么写、用户那么问」 |
 | `followLinks` | true | 是否跟随技能库内部的目录软链 |
 
 ## 索引行为
