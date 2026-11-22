@@ -59,7 +59,7 @@ function isDir(p) {
 
 function parseFrontmatter(text) {
   const lines = text.split(/\r?\n/)
-  if (lines[0]?.trim() !== '---') return { name: '', description: '' }
+  if (lines[0]?.trim() !== '---') return { name: '', description: '', notFor: '' }
 
   let end = -1
   for (let i = 1; i < Math.min(lines.length, 200); i++) {
@@ -68,16 +68,25 @@ function parseFrontmatter(text) {
       break
     }
   }
-  if (end < 0) return { name: '', description: '' }
+  if (end < 0) return { name: '', description: '', notFor: '' }
 
   let name = ''
   let description = ''
+  let notFor = ''
   let i = 1
   while (i < end) {
     const line = lines[i]
     const nameMatch = /^name:\s*(.+)$/.exec(line)
     if (nameMatch) {
       name = nameMatch[1].trim().replace(/^["']|["']$/g, '')
+      i++
+      continue
+    }
+    // when-not-to-use 是这一版加的约定字段：一行说清什么时候别用。
+    // 没有就当没写，不硬凑。
+    const notForMatch = /^(?:when-not-to-use|when_not_to_use):\s*(.+)$/.exec(line)
+    if (notForMatch) {
+      notFor = notForMatch[1].trim().replace(/^["']|["']$/g, '')
       i++
       continue
     }
@@ -105,7 +114,7 @@ function parseFrontmatter(text) {
     i++
   }
 
-  return { name, description: description.replace(/\s+/g, ' ').trim() }
+  return { name, description: description.replace(/\s+/g, ' ').trim(), notFor: notFor.replace(/\s+/g, ' ').trim() }
 }
 
 // ---------------------------------------------------------------- 索引
@@ -156,6 +165,7 @@ function walk(root, depth, out, visited, base) {
       folder: path.basename(dir),
       category: parts.length > 1 ? parts[0] : '(uncategorized)',
       description: fm.description,
+      notFor: fm.notFor,
       path: full,
       dir,
     })
@@ -205,6 +215,8 @@ function enrich(skill) {
     return
   }
   skill.chars = text.length
+  // 正文兜底检索用。只留前 20KB，够覆盖开头的方法与工具段。
+  skill.body = text.toLowerCase().slice(0, 20000)
   skill.headings = [...text.matchAll(/^##\s+(.+)$/gm)].map((m) => m[1].trim()).slice(0, 14)
 
   const dir = path.dirname(skill.path)
@@ -237,13 +249,17 @@ function buildDigest(skill, maxChars = 1400) {
   const lines = []
   lines.push(`# ${skill.name}  [${skill.category}]`)
   lines.push(`全文 ≈${(skill.chars / 1.6 / 1000).toFixed(1)}k tokens · ${skill.path}`)
+  if (skill.notFor) {
+    lines.push('')
+    lines.push(`不适合：${skill.notFor}`)
+  }
   if (skill.description) {
     lines.push('')
     lines.push(skill.description.length > 300 ? skill.description.slice(0, 297) + '…' : skill.description)
   }
   // 描述很少写清「什么时候不该用」，但判断阶段这条信息最值钱。
   // 只有少数技能有这一节，有就带上，没有就不硬凑。
-  if (skill.text) {
+  if (!skill.notFor && skill.text) {
     const notFor = skill.text.match(/^#{1,3}[^\n]*(?:不该用|不适用|什么时候不用|何时不用)[^\n]*\n([\s\S]{0,320})/m)
     if (notFor) {
       lines.push('')
@@ -325,21 +341,40 @@ function activeLine(exec) {
   return `已加载：${parts.join('、')} —— 若本次任务与它们无关，先调 skill_drop 停用，不要沿用它的流程。`
 }
 
+// 中文查询常常不带空格（"去水印"、"字体子集"），整词子串匹配会漏掉
+// 「去AI图片水印」这种名字。补二元组让分词不依赖空格。
+function queryTerms(words) {
+  const terms = []
+  for (const raw of words) {
+    const w = raw.toLowerCase()
+    if (!w) continue
+    terms.push({ text: w, weight: 1 })
+    if (/[\u4e00-\u9fff]/.test(w) && w.length >= 3) {
+      for (let i = 0; i < w.length - 1; i++) {
+        const bigram = w.slice(i, i + 2)
+        if (/[\u4e00-\u9fff]{2}/.test(bigram)) terms.push({ text: bigram, weight: 0.75 })
+      }
+    }
+  }
+  return terms
+}
+
 function score(skill, words, usage) {
   const name = skill.name.toLowerCase()
   const folder = skill.folder.toLowerCase()
   const cat = skill.category.toLowerCase()
   const desc = skill.description.toLowerCase()
+  const heads = (skill.headings ?? []).join(' ').toLowerCase()
   let total = 0
-  for (const raw of words) {
-    const w = raw.toLowerCase()
-    if (!w) continue
-    if (name === w) total += 20
-    else if (name.includes(w)) total += 10
-    if (folder.includes(w)) total += 6
-    if (cat.includes(w)) total += 4
-    if (desc.includes(w)) total += 3
+  for (const { text: w, weight } of queryTerms(words)) {
+    if (name === w) total += 20 * weight
+    else if (name.includes(w)) total += 10 * weight
+    if (folder.includes(w)) total += 6 * weight
+    if (cat.includes(w)) total += 4 * weight
+    if (desc.includes(w)) total += 3 * weight
+    if (heads.includes(w)) total += 2 * weight
   }
+  total = Math.round(total)
   if (total === 0) return 0
   // 读过的技能排前面：最多 +120%，十次封顶
   const uses = usage?.get(skill.name.toLowerCase())?.count ?? 0
@@ -400,6 +435,33 @@ function registerSearch(ctx, config) {
           .sort((a, b) => b.score - a.score)
           .slice(0, Math.max(1, Math.min(30, args.limit ?? config.maxResults ?? 8)))
 
+        const ledger = activeLine(exec)
+        const prefix = ledger ? `[技能台账] ${ledger}` : null
+
+        // 元数据命中不够时，再翻正文。woff2、pyftsubset 这类词通常只写在正文里。
+        // 权重压得很低，所以不会盖过名字/描述层面的命中。
+        let deepHit = false
+        if (ranked.length === 0 || ranked[0].score < 6) {
+          const terms = queryTerms(words)
+          const deep = []
+          for (const s of skills) {
+            if (!s.body) continue
+            const base = ranked.find((r) => r.skill === s)?.score ?? 0
+            let extra = 0
+            for (const { text: w, weight } of terms) {
+              if (s.body.includes(w)) extra += 3 * weight
+            }
+            if (extra > 0) deep.push({ skill: s, score: Math.round(base + extra) })
+          }
+          deep.sort((a, b) => b.score - a.score)
+          // 正文命中天然比元数据弱，阈值跟着降；但只在元数据几乎没命中时才会走到这。
+          if (deep.length && deep[0].score >= 3) {
+            ranked.length = 0
+            ranked.push(...deep.slice(0, 8))
+            deepHit = true
+          }
+        }
+
         if (ranked.length === 0) {
           return (
             `No skill matched "${words.join(' ')}" among ${skills.length} indexed skills.\n` +
@@ -407,12 +469,10 @@ function registerSearch(ctx, config) {
           )
         }
 
-        const ledger = activeLine(exec)
-        const prefix = ledger ? `[技能台账] ${ledger}` : null
-
         // 弱匹配不铺开：最高分不够就别浪费 token 列描述，只报名字让人换词重搜
         const MIN_STRONG = 6
-        if (ranked[0].score < MIN_STRONG) {
+        // 正文兜底命中本来就分低，别再拿元数据阈值拦它一遍
+        if (!deepHit && ranked[0].score < MIN_STRONG) {
           const names = ranked.slice(0, 5).map((r) => r.skill.name).join(', ')
           return [
             prefix,
@@ -423,7 +483,7 @@ function registerSearch(ctx, config) {
             .join('\n')
         }
 
-        const header = `Matched ${ranked.length} of ${skills.length} indexed skills for "${words.join(' ')}":`
+        const header = `Matched ${ranked.length} of ${skills.length} indexed skills for "${words.join(' ')}"${deepHit ? '（按正文命中）' : ''}:`
         const body = ranked.map((r) =>
           formatHit(r.skill, r.score, usage.get(r.skill.name.toLowerCase())?.count ?? 0, r.skill.chars),
         )
