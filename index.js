@@ -31,13 +31,23 @@ export const Config = Schema.object({
     .default(['~/.skills'])
     .description('技能库根目录。支持 ~ 与 $ENV 变量；可以给多个。'),
   maxResults: Schema.number().default(8).description('搜索结果条数上限。'),
-  refreshSeconds: Schema.number().default(300).description('索引缓存有效期（秒）。'),
+  refreshSeconds: Schema.number().default(300).description('索引缓存有效期（秒）；0 表示每次都重建。'),
+  // 这三项代码里一直在读，但 schema 没声明，等于从配置界面设不了。
+  autoHint: Schema.boolean().default(true).description('每轮第一步自动检索一次，强命中就提示一行。'),
+  autoHintMinScore: Schema.number().default(14).description('自动提示的分数门槛，调高更安静。'),
+  followLinks: Schema.boolean()
+    .default(true)
+    .description('是否跟随技能库内部的目录软链/junction。关掉可以防止库里的链接指向库外。'),
 })
 
 // ---------------------------------------------------------------- 路径
 
 function expand(p) {
-  let out = p
+  // Schema.array(Schema.string()) 会放行 null，YAML 里写 "- " 就能把 null 传进来。
+  // 以前这里 undefined.startsWith 直接抛，而且是三个工具共用的前置步骤——一处崩全崩。
+  if (typeof p !== 'string') return ''
+  let out = p.trim()
+  if (!out) return ''
   if (out.startsWith('~')) out = path.join(os.homedir(), out.slice(1))
   out = out.replace(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g, (m, k) => process.env[k] ?? m)
   out = out.replace(/%([A-Za-z0-9_()]+)%/g, (m, k) => process.env[k] ?? m)
@@ -129,7 +139,7 @@ function stripFrontmatter(text) {
   return m ? text.slice(m[0].length) : text
 }
 
-function walk(root, depth, out, visited, base, viaLink) {
+function walk(root, depth, out, visited, base, viaLink, followLinks) {
   if (depth > MAX_DEPTH || out.length >= MAX_FILES) return
 
   // 只在根和软链上做 realpath：
@@ -163,7 +173,8 @@ function walk(root, depth, out, visited, base, viaLink) {
     let link = false
     if (e.isSymbolicLink()) {
       // 用软链组织的技能库很常见（~/.skills/foo -> ~/repos/foo）。
-      // 以前直接 continue，整个库会静默丢失且不给任何提示。
+      // 但跟随也意味着"库里的链接可以指到任何地方"，所以留一个开关能关掉。
+      if (!followLinks) continue
       try {
         isDirEntry = fs.statSync(full).isDirectory()
         link = true
@@ -173,7 +184,7 @@ function walk(root, depth, out, visited, base, viaLink) {
     }
 
     if (isDirEntry) {
-      walk(full, depth + 1, out, visited, base, link)
+      walk(full, depth + 1, out, visited, base, link, followLinks)
       continue
     }
     if (e.name !== 'SKILL.md') continue
@@ -202,18 +213,21 @@ function walk(root, depth, out, visited, base, viaLink) {
 }
 
 function buildIndex(config, force) {
-  const roots = (config.roots?.length ? config.roots : ['~/.skills']).map(expand)
+  // 显式写 roots: [] 表示"我就是要空库"，只有完全没配才回落 ~/.skills。
+  const configured = Array.isArray(config.roots) ? config.roots : ['~/.skills']
+  const roots = configured.map(expand).filter(Boolean)
   // 缓存必须按 roots 分键：同一个进程里插件被重新挂载、或 profile 覆盖挂两份时，
   // 不区分就会拿上一份根目录的索引，而且不报错。
   const key = roots.join('|').toLowerCase()
-  const ttl = (config.refreshSeconds || 300) * 1000
+  // 0 是合法值（每次都用新索引），|| 会把它变成 300 秒，加了技能要等五分钟。
+  const ttl = (config.refreshSeconds ?? 300) * 1000
   if (!force && cache.at > 0 && cache.key === key && Date.now() - cache.at < ttl) return cache.skills
 
   const all = []
   for (const root of roots) {
     if (!isDir(root)) continue
     const found = []
-    walk(root, 0, found, new Set(), root, false)
+    walk(root, 0, found, new Set(), root, false, config.followLinks !== false)
     for (const s of found) all.push(s)
   }
 
@@ -346,26 +360,47 @@ function usageMtime() {
   }
 }
 
+// 唯一的读入口：坏文件先备份再当空表。
+// loadUsage 和 recordUsage 都必须走这里——recordUsage 自己 try/catch 一次，
+// 就会绕过备份，把坏文件直接覆盖掉（备份测出来是"无"就是这么来的）。
+function readUsageFile() {
+  try {
+    return new Map(Object.entries(JSON.parse(fs.readFileSync(USAGE_PATH, 'utf8'))))
+  } catch (e) {
+    if (e && e.code !== 'ENOENT') {
+      try {
+        fs.renameSync(USAGE_PATH, `${USAGE_PATH}.bad-${Date.now()}`)
+      } catch {
+        /* 备份不了就算了，别让它影响检索 */
+      }
+    }
+    return new Map()
+  }
+}
+
 function loadUsage() {
   const stamp = usageMtime()
   if (usageCache && stamp === usageStamp) return usageCache
-  try {
-    usageCache = new Map(Object.entries(JSON.parse(fs.readFileSync(USAGE_PATH, 'utf8'))))
-  } catch {
-    usageCache = new Map()
-  }
-  usageStamp = stamp
+  usageCache = readUsageFile()
+  usageStamp = usageMtime()
   return usageCache
 }
 
 function recordUsage(name) {
-  const usage = loadUsage()
   const key = name.toLowerCase()
+  // 写之前重新读盘：领着旧快照整表覆盖，会把别的进程刚写的计数抹掉
+  // （实测 6 进程 ×40 次读，期望 240 实际只剩 41）。
+  const usage = readUsageFile()
   const prev = usage.get(key) ?? { count: 0, last: null }
-  usage.set(key, { count: prev.count + 1, last: new Date().toISOString() })
+  const count = (Number.isFinite(prev.count) ? prev.count : 0) + 1
+  usage.set(key, { count, last: new Date().toISOString() })
+  usageCache = usage
   try {
     fs.mkdirSync(path.dirname(USAGE_PATH), { recursive: true })
-    fs.writeFileSync(USAGE_PATH, JSON.stringify(Object.fromEntries(usage), null, 1), 'utf8')
+    // 先写临时文件再改名：写一半崩掉不会留下半截 JSON
+    const tmp = `${USAGE_PATH}.${process.pid}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify(Object.fromEntries(usage), null, 1), 'utf8')
+    fs.renameSync(tmp, USAGE_PATH)
     usageStamp = usageMtime()
   } catch {
     // 记不上不影响检索，静默放着
@@ -635,7 +670,11 @@ function registerSearch(ctx, config) {
           .map((s) => ({ skill: s, score: score(s, terms, idfMap, usage) }))
           .filter((r) => r.score > 0)
           .sort((a, b) => b.score - a.score)
-          .slice(0, Math.max(1, Math.min(30, args.limit ?? config.maxResults ?? 8)))
+          .slice(0, (() => {
+          // limit 传字符串/NaN/负数都不能让它变成 Infinity 或 0
+          const wanted = Number(args.limit ?? config.maxResults ?? 8)
+          return Math.max(1, Math.min(30, Number.isFinite(wanted) ? Math.trunc(wanted) : 8))
+        })())
 
         // 头名 38 分、后面跟着 2 分的条目，那不是候选，是噪音——
         // 每条要花 30 多个 token，还稀释判断。低于头名 20% 的直接不显示。
@@ -678,7 +717,7 @@ function registerSearch(ctx, config) {
           }
 
           return (
-            `No skill matched "${words.join(' ')}" among ${skills.length} indexed skills.\n` +
+            `No skill matched "${words.join(' ').slice(0, 60)}" among ${skills.length} indexed skills.\n` +
             'Try fewer or different keywords, or call skill_catalog to see the categories.'
           )
         }
@@ -789,9 +828,14 @@ function registerRead(ctx, config) {
           skills.find((s) => s.folder.toLowerCase() === key)
         let hit = exact
         if (!hit) {
-          const partial = skills.filter(
-            (s) => s.name.toLowerCase().includes(key) || s.folder.toLowerCase().includes(key),
-          )
+          // key 太短时子串匹配没有意义："x" 能匹配到几乎所有技能，
+          // 而且会真的读错一份文件、把记账记到它头上。
+          const partial =
+            key.length < 3
+              ? []
+              : skills.filter(
+                  (s) => s.name.toLowerCase().includes(key) || s.folder.toLowerCase().includes(key),
+                )
           if (partial.length > 1) {
             const names = partial.slice(0, 8).map((s) => s.name).join(', ')
             return `"\${wanted}" 匹配到多个技能：\${names}。请用完整名字。`
@@ -812,7 +856,7 @@ function registerRead(ctx, config) {
           return `ERROR: cannot read ${hit.path}: ${e.message}`
         }
         recordUsage(hit.name)
-        const mode = String(args.mode ?? 'digest').toLowerCase()
+        const mode = String(args.mode ?? 'digest').trim().toLowerCase()
 
         if (mode !== 'full') {
           const digest = buildDigest({ ...hit, chars: text.length, text })
