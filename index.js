@@ -822,32 +822,49 @@ function registerRead(ctx, config) {
           return `No skills indexed. Checked roots: ${roots || '(none configured)'}`
         }
 
-        const key = wanted.toLowerCase()
+        // 支持 "name @folder" 和 "name（folder）" 两种写法：
+        // 重名时提示里给的就是这个格式，必须能原样贴回来。
+        let raw = String(wanted).trim()
+        let hint = ''
+        const sepAt = raw.search(/[@（(]/)
+        if (sepAt > 0) {
+          hint = raw
+            .slice(sepAt + 1)
+            .replace(/[）)]$/, '')
+            .trim()
+            .toLowerCase()
+          raw = raw.slice(0, sepAt).trim()
+        }
+        const key = raw.toLowerCase()
+
         // 先精确，再模糊。模糊命中必须唯一——
         // 以前 find 拿到哪个算哪个，"extract" 会静默返回 pdf-extract 并把记账记到它头上。
-        const exact =
-          skills.find((s) => s.name.toLowerCase() === key) ??
-          skills.find((s) => s.folder.toLowerCase() === key)
-        let hit = exact
+        let hit =
+          skills.find(
+            (s) => s.name.toLowerCase() === key && (!hint || s.folder.toLowerCase() === hint),
+          ) ??
+          skills.find((s) => s.folder.toLowerCase() === key && !hint)
+
         if (!hit) {
-          // key 太短时子串匹配没有意义："x" 能匹配到几乎所有技能，
-          // 而且会真的读错一份文件、把记账记到它头上。
+          // 只挡单字符："x" 能匹配到几乎所有技能。
+          // 两字母的 mv / ai / ui 是常用缩写，砍掉它们会让 read 和 search 自相矛盾
+          // （search 能列出 4 个 mv，read 却说没这个技能）。
           const partial =
-            key.length < 3
+            key.length < 2
               ? []
               : skills.filter(
                   (s) => s.name.toLowerCase().includes(key) || s.folder.toLowerCase().includes(key),
                 )
           if (partial.length > 1) {
-            // 同名不同目录时只给名字没法区分（ppt-master 就有两份），
-            // 这种情况补上目录名——skill_read 也认目录。
+            // 同名不同目录时只给名字没法区分（ppt-master 就有两份）。
+            // 格式必须能原样贴回来，所以用 @ 分隔并在文案里说清楚。
             const seen = new Map()
             for (const s of partial) seen.set(s.name.toLowerCase(), (seen.get(s.name.toLowerCase()) ?? 0) + 1)
             const names = partial
               .slice(0, 8)
-              .map((s) => (seen.get(s.name.toLowerCase()) > 1 ? `${s.name}（${s.folder}）` : s.name))
+              .map((s) => (seen.get(s.name.toLowerCase()) > 1 ? `${s.name} @${s.folder}` : s.name))
               .join(', ')
-            return `"${wanted}" 匹配到多个技能：${names}。请用完整名字。`
+            return `"${wanted}" 匹配到多个技能：${names}。用完整名字，重名时写成 名字 @目录。`
           }
           hit = partial[0]
         }
