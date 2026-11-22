@@ -1099,12 +1099,15 @@ function registerAutoHint(ctx, config) {
         // 终端日志里全是 npm run build / fix grid / eslint，
         // 认裸动词会把 500 字日志当成请求（实测误报过一次）。
         const hasRequest = (s) =>
-          // 只认"明确指使"的词。
-          // 需要/想要/分析/检查 这些在陈述句里到处都是——
-          // 「需要增加超时重试」不是让我做事，会议纪要因此被误判成请求。
-          /(帮我|帮忙|麻烦你|麻烦帮|请你|您帮|能不能|可不可以|如何|怎么|做一个|写一个|生成一?个|改一下|看一下|看看这个|评估一下|排查一下)/.test(
-            s,
-          ) ||
+          // 三层：地址式 / 疑问式 / 动词+一下。
+          // 枚举具体动词必然漏——「改一下」在表里而「检查一下」不在，
+          // 这不是取舍，是枚举法的必然。用结构代替清单。
+          //
+          // 会议纪要里的「需要增加超时重试」三者都不命中，所以不会误报。
+          /(帮我|帮忙|麻烦|请你|您帮|需要你|能不能|可不可以)/.test(s) ||
+          /(做|写|生成|整理|评估|排查|改|查)(一个|个|份|版)/.test(s) ||
+          /(如何|怎么|为什么|为何|哪里|哪儿|是不是|有没有|能否|是否|什么原因|怎么回事)/.test(s) ||
+          /\S{1,6}(一下|看下|看看)/.test(s) ||
           /\b(can you|could you|would you|please|help me|i (need|want|would like)|how (do|to|can|should) i)\b/i.test(s)
 
         const fence = text.search(/\`\`\`/)
@@ -1124,7 +1127,10 @@ function registerAutoHint(ctx, config) {
         const skills = buildIndex(config, false)
         if (skills.length === 0) return decision
 
-        const words = text.split(/[\s,，。；;？?！!]+/).filter(Boolean).slice(0, 8)
+        // 长文按长度多取几个词：固定 8 个会把 500 字的真实需求稀释到门槛之下，
+        // 再叠加"长文门槛 1.5 倍"，等于双重惩罚。
+        const rawWords = text.split(/[\s,，。；;？?！!]+/).filter(Boolean)
+        const words = rawWords.slice(0, 8 + Math.floor(text.length / 200))
         const terms = queryTerms(words)
         const idfMap = new Map(terms.map((tm) => [tm.text, termIdf(tm.text, skills)]))
         const best = skills
