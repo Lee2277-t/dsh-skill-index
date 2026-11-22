@@ -1,6 +1,6 @@
 {
   "name": "dsh-skill-index",
-  "version": "1.6.17",
+  "version": "1.6.18",
   "description": "Search a local agent-skill library with CJK-aware, IDF-weighted matching and a bilingual glossary; read a skill as a digest or in full; hint the likely skill at the start of each turn; keep a per-session ledger. Ships an evaluation harness.",
   "type": "module",
   "main": "index.js",

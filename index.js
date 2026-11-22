@@ -47,6 +47,9 @@ export const Config = Schema.object({
   // 这三项代码里一直在读，但 schema 没声明，等于从配置界面设不了。
   autoHint: Schema.boolean().default(true).description('每轮第一步自动检索一次，强命中就提示一行。'),
   autoHintMinScore: Schema.number().default(14).description('自动提示的分数门槛，调高更安静。'),
+  // 每个技能一份"用户会怎么说"的别名。通用中英词表解决不了作者与用户用词不同的问题，
+  // 这里让用户自己补：{ "技能名": ["口语说法", "另一种说法"] }。
+  aliases: Schema.any().description('按技能名补口语别名：{ "技能名": ["用户会怎么问"] }。'),
   followLinks: Schema.boolean()
     .default(true)
     .description('是否跟随技能库内部的目录软链/junction。关掉可以防止库里的链接指向库外。'),
@@ -275,7 +278,7 @@ function buildIndex(config, force) {
   const roots = rootsOf(config)
   // 缓存必须按 roots 分键：同一个进程里插件被重新挂载、或 profile 覆盖挂两份时，
   // 不区分就会拿上一份根目录的索引，而且不报错。
-  const key = roots.join('|').toLowerCase()
+  const key = roots.join('|').toLowerCase() + '|' + JSON.stringify(config?.aliases ?? null)
   // 0 是合法值（每次都用新索引），|| 会把它变成 300 秒，加了技能要等五分钟。
   const ttl = (config.refreshSeconds ?? 300) * 1000
   if (!force && cache.at > 0 && cache.key === key && Date.now() - cache.at < ttl) return cache.skills
@@ -298,6 +301,12 @@ function buildIndex(config, force) {
   }
 
   const skills = [...byKey.values()]
+  // 别名挂在索引项上，和技能正文分开——它只影响打分，不改变技能内容。
+  const aliasMap = config?.aliases && typeof config.aliases === 'object' ? config.aliases : {}
+  for (const s of skills) {
+    const list = aliasMap[s.name] ?? aliasMap[s.name.toLowerCase()]
+    s.aliases = Array.isArray(list) ? list.join(' ').toLowerCase() : ''
+  }
   for (const s of skills) {
     enrich(s, s._text)
     delete s._text
@@ -698,13 +707,14 @@ function termIdf(term, skills) {
 // 自述是"合集/入口/枢纽"的技能，多半是把人引到别的技能去，自己不做这件事。
 const HUB_RE = /(合集|总入口|入口|编排|分发|路由|hub|dispatcher|collection of|entry point|router)/i
 
-function score(skill, terms, idfMap, usage) {
+function score(skill, terms, idfMap, usage, queryLower) {
   const name = skill.name.toLowerCase()
   const folder = skill.folder.toLowerCase()
   const cat = skill.category.toLowerCase()
   const desc = skill.description.toLowerCase()
   const heads = (skill.headings ?? []).join(' ').toLowerCase()
   const notFor = (skill.notFor ?? '').toLowerCase()
+  const aliases = skill.aliases ?? ''
   let total = 0
   for (const { text: w, weight, gloss } of terms) {
     // 名字命中是最强证据；但翻译来的词只算半个证据——
@@ -721,8 +731,13 @@ function score(skill, terms, idfMap, usage) {
     const damp = idf
     if (desc.includes(w)) total += 3 * weight * damp
     if (heads.includes(w)) total += 2 * weight * damp
+    // 别名是"用户会这么问"的直接证据，比描述命中强一档，但弱于名字命中。
+    if (aliases && aliases.includes(w)) total += 4 * weight * damp
     if (notFor.includes(w)) total += 1 * weight * damp
   }
+  // 请求里原样出现技能名（如"用 ppt-master 做"）是最强信号：用户已经指定了。
+  // 太短的名字会误中普通词，四个字符起才认。
+  if (queryLower && name.length >= 4 && queryLower.includes(name)) total += 25
   total = Math.round(total)
   if (total === 0) return 0
   // 入口型技能降权：合集/枢纽的 description 往往直接写着任务词（"整站审计"），
@@ -820,7 +835,7 @@ function registerSearch(ctx, config) {
         const terms = queryTerms(words)
         const idfMap = new Map(terms.map((tm) => [tm.text, termIdf(tm.text, skills)]))
         const ranked = skills
-          .map((s) => ({ skill: s, score: score(s, terms, idfMap, usage) }))
+          .map((s) => ({ skill: s, score: score(s, terms, idfMap, usage, String(args.query ?? '').toLowerCase()) }))
           .filter((r) => r.score > 0)
           .sort((a, b) => b.score - a.score)
           .slice(0, limit)
@@ -1180,7 +1195,7 @@ function registerAutoHint(ctx, config) {
         const terms = queryTerms(words)
         const idfMap = new Map(terms.map((tm) => [tm.text, termIdf(tm.text, skills)]))
         const best = skills
-          .map((s) => ({ skill: s, score: score(s, terms, idfMap, new Map()) }))
+          .map((s) => ({ skill: s, score: score(s, terms, idfMap, new Map(), text.toLowerCase()) }))
           .filter((r) => r.score > 0)
           .sort((a, b) => b.score - a.score)[0]
 
@@ -1277,8 +1292,17 @@ function registerActive(ctx, config) {
         if (usageDropped > 0) {
           notices.push(`记账有 ${usageDropped} 次因并发冲突放弃，排序权重可能略偏。`)
         }
+        // 「哪些技能是死重量」——索引里有、台账里没有的就是从未被读过。
+        // 只统计这一侧（读过几次），不假装知道模型有没有用上它。
+        const allSkills = buildIndex(config, false)
+        const ledger = loadUsage()
+        const touched = allSkills.filter((s) => (ledger.get(s.name.toLowerCase())?.count ?? 0) > 0).length
+        const ledgerLine = allSkills.length
+          ? `使用台账：${allSkills.length} 个技能里 ${touched} 个读过（${Math.round((touched / allSkills.length) * 100)}%），${allSkills.length - touched} 个从未读过。`
+          : null
+
         if (active.size === 0) {
-          return [`本会话没有加载过技能。当前任务可以直接做，或先 skill_search 看有没有适用的。`, ...notices, '', hintLine]
+          return [`本会话没有加载过技能。当前任务可以直接做，或先 skill_search 看有没有适用的。`, ledgerLine, ...notices, '', hintLine]
             .filter((x) => x !== null)
             .join('\n')
         }
@@ -1300,6 +1324,7 @@ function registerActive(ctx, config) {
           '真正释放要等压缩。技能里最贵的不是搜索，是「加载了却用不上还一直占着」。',
           '',
           ...notices,
+          ledgerLine,
           hintLine,
         ].filter((x) => x !== null).join('\n')
       },
