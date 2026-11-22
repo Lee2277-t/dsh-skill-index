@@ -839,7 +839,14 @@ function registerRead(ctx, config) {
                   (s) => s.name.toLowerCase().includes(key) || s.folder.toLowerCase().includes(key),
                 )
           if (partial.length > 1) {
-            const names = partial.slice(0, 8).map((s) => s.name).join(', ')
+            // 同名不同目录时只给名字没法区分（ppt-master 就有两份），
+            // 这种情况补上目录名——skill_read 也认目录。
+            const seen = new Map()
+            for (const s of partial) seen.set(s.name.toLowerCase(), (seen.get(s.name.toLowerCase()) ?? 0) + 1)
+            const names = partial
+              .slice(0, 8)
+              .map((s) => (seen.get(s.name.toLowerCase()) > 1 ? `${s.name}（${s.folder}）` : s.name))
+              .join(', ')
             return `"${wanted}" 匹配到多个技能：${names}。请用完整名字。`
           }
           hit = partial[0]
