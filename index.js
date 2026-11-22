@@ -307,40 +307,41 @@ function enrich(skill, text) {
 // digest：只够判断"要不要用它"，不够照着做。
 // 中位 310 tokens，全文 3,853 —— 判断阶段贵 12 倍没有道理。
 function buildDigest(skill, maxChars = 1400) {
-  const lines = []
-  lines.push(`# ${skill.name}  [${skill.category}]`)
-  lines.push(`全文 ≈${(skill.chars / 1.6 / 1000).toFixed(1)}k tokens · ${skill.path}`)
-  if (skill.notFor) {
-    lines.push('')
-    lines.push(`不适合：${skill.notFor}`)
-  }
+  const head = [`# ${skill.name}  [${skill.category}]`, `全文 ≈${(skill.chars / 1.6 / 1000).toFixed(1)}k tokens · ${skill.path}`]
+  if (skill.notFor) head.push('', `不适合：${skill.notFor}`)
   if (skill.description) {
-    lines.push('')
-    lines.push(skill.description.length > 300 ? skill.description.slice(0, 297) + '…' : skill.description)
+    head.push('', skill.description.length > 300 ? skill.description.slice(0, 297) + '…' : skill.description)
   }
-  // 描述很少写清「什么时候不该用」，但判断阶段这条信息最值钱。
-  // 只有少数技能有这一节，有就带上，没有就不硬凑。
-  if (!skill.notFor && skill.text) {
-    const notFor = skill.text.match(/^#{1,3}[^\n]*(?:不该用|不适用|什么时候不用|何时不用)[^\n]*\n([\s\S]{0,320})/m)
-    if (notFor) {
-      lines.push('')
-      lines.push('## 什么时候不该用（原文）')
-      lines.push(notFor[1].trim().slice(0, 300))
+
+  // 这句必须出现：整个插件的节流靠它——先看 digest 判断，要照做才读全文。
+  // 以前是"拼完再截尾"，结果文件多的技能（ppt-master 有 20 个文件）把这句截掉了，
+  // digest 变成一张文件清单，最该传递的信息反而丢了。
+  const tail = `要照它做，调 skill_read({ name: "${skill.name}", mode: "full" }) 读全文。`
+
+  const refs = skill.refs ?? []
+  const heads = skill.headings ?? []
+
+  // 逐级压缩：先砍文件清单，再砍章节，最后才动描述。
+  for (const refCap of [refs.length, 6, 0]) {
+    for (const headCap of [heads.length, 8, 0]) {
+      const parts = [...head]
+      if (headCap) parts.push('', '## 结构', heads.slice(0, headCap).map((h) => `- ${h}`).join('\n'))
+      if (refCap) {
+        const list = refs.slice(0, refCap).map((r) => `- ${r.path}  ${(r.chars / 1024).toFixed(1)}KB`)
+        if (refs.length > refCap) list.push(`- …还有 ${refs.length - refCap} 个`)
+        parts.push('', '## 附带文件（按需读，不用整份载入）', list.join('\n'))
+      }
+      parts.push('', tail)
+      const out = parts.join('\n')
+      if (out.length <= maxChars) return out
     }
   }
-  if (skill.headings.length) {
-    lines.push('')
-    lines.push('## 结构')
-    lines.push(skill.headings.map((h) => `- ${h}`).join('\n'))
-  }
-  if (skill.refs.length) {
-    lines.push('')
-    lines.push('## 附带文件（按需读，不用整份载入）')
-    for (const r of skill.refs) lines.push(`- ${r.path}  ${(r.chars / 1024).toFixed(1)}KB`)
-  }
-  lines.push('')
-  lines.push(`要照它做，调 skill_read({ name: "${skill.name}", mode: "full" }) 读全文。`)
-  const out = lines.join('\n')
+
+  // 极端情况：连描述都太长。截描述，tail 依然保留。
+  const slim = [`# ${skill.name}  [${skill.category}]`, `全文 ≈${(skill.chars / 1.6 / 1000).toFixed(1)}k tokens · ${skill.path}`, '']
+  if (skill.notFor) slim.push(`不适合：${skill.notFor}`, '')
+  slim.push(tail)
+  const out = slim.join('\n')
   return out.length > maxChars ? out.slice(0, maxChars) + '\n…（digest 已截断）' : out
 }
 
