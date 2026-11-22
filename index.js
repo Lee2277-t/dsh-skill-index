@@ -470,8 +470,23 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 // （期间 20ms 定时器跑了 0 次，别的会话和 UI 全不响应）。
 // 丢一次排序权重的代价，远小于卡住整个进程——所以这里全部走 await，
 // 抢锁预算也压到 300ms：抢不到就放弃，不能为了记一笔账拖慢别人。
-async function recordUsage(name) {
-  const key = name.toLowerCase()
+// 台账按「名字 + 目录」记。同名技能可以有两份（主副本 + 上游副本），
+// 只按名字记的话，读了一个会被算成两个都读过——台账立刻失真。
+function usageKey(skill) {
+  return `${skill.name}|${skill.folder}`.toLowerCase()
+}
+
+// 读台账：先找精确键，找不到退回旧格式（只记名字的版本）。
+function usageCount(usage, skill) {
+  if (!usage) return 0
+  const exact = usage.get(usageKey(skill))
+  if (exact) return Number.isFinite(exact.count) ? exact.count : 0
+  const legacy = usage.get(skill.name.toLowerCase())
+  return Number.isFinite(legacy?.count) ? legacy.count : 0
+}
+
+async function recordUsage(skill) {
+  const key = usageKey(skill)
   const lock = `${USAGE_PATH}.lock`
 
   try {
@@ -744,7 +759,7 @@ function score(skill, terms, idfMap, usage, queryLower) {
   // 名字匹配又最重，于是它排到真正干活的技能前面。
   if (HUB_RE.test(desc)) total = Math.round(total * 0.85)
   // 读过的技能排前面：最多 +120%，十次封顶
-  const uses = usage?.get(skill.name.toLowerCase())?.count ?? 0
+  const uses = usageCount(usage, skill)
   return uses > 0 ? Math.round(total * (1 + 0.12 * Math.min(uses, 10))) : total
 }
 
@@ -905,7 +920,7 @@ function registerSearch(ctx, config) {
         const shown = words.join(' ').slice(0, 60)
         const header = `Matched ${ranked.length} of ${skills.length} indexed skills for "${shown}${words.join(' ').length > 60 ? '…' : ''}":`
         const body = ranked.map((r) =>
-          formatHit(r.skill, r.score, usage.get(r.skill.name.toLowerCase())?.count ?? 0, r.skill.chars),
+          formatHit(r.skill, r.score, usageCount(usage, r.skill), r.skill.chars),
         )
         return [prefix, header, '', ...body].filter((x) => x !== null).join('\n')
       },
@@ -1051,7 +1066,7 @@ function registerRead(ctx, config) {
         } catch (e) {
           return `ERROR: cannot read ${hit.path}: ${e.message}`
         }
-        await recordUsage(hit.name)
+        await recordUsage(hit)
         const mode = String(args.mode ?? 'digest').trim().toLowerCase()
 
         if (mode !== 'full') {
@@ -1296,7 +1311,7 @@ function registerActive(ctx, config) {
         // 只统计这一侧（读过几次），不假装知道模型有没有用上它。
         const allSkills = buildIndex(config, false)
         const ledger = loadUsage()
-        const touched = allSkills.filter((s) => (ledger.get(s.name.toLowerCase())?.count ?? 0) > 0).length
+        const touched = allSkills.filter((s) => usageCount(ledger, s) > 0).length
         const ledgerLine = allSkills.length
           ? `使用台账：${allSkills.length} 个技能里 ${touched} 个读过（${Math.round((touched / allSkills.length) * 100)}%），${allSkills.length - touched} 个从未读过。`
           : null
